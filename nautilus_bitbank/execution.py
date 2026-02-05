@@ -170,6 +170,7 @@ class BitbankExecutionClient(LiveExecutionClient):
         instrument_id = order.instrument_id
         pair = instrument_id.symbol.value.replace("/", "_").lower()
         last_executed_qty = Decimal("0")
+        reported_trade_ids = set()
         
         # Determine quote currency for Money objects
         # e.g. BTC/JPY -> JPY
@@ -190,27 +191,74 @@ class BitbankExecutionClient(LiveExecutionClient):
 
                 # Check for new fills
                 if executed_qty > last_executed_qty:
-                    fill_qty = executed_qty - last_executed_qty
-                    last_executed_qty = executed_qty
-                    
-                    # Generate Fill Report
-                    self.generate_order_filled(
-                        strategy_id=order.strategy_id,
-                        instrument_id=order.instrument_id,
-                        client_order_id=order.client_order_id,
-                        venue_order_id=venue_order_id,
-                        venue_position_id=None,
-                        trade_id=TradeId(f"BB-{venue_order_id}-{self._clock.timestamp_ns()}"),
-                        order_side=order.side,
-                        order_type=order.order_type,
-                        last_qty=fill_qty,
-                        last_px=avg_price,
-                        quote_currency=quote_currency,
-                        commission=Money(0, quote_currency), # Need actual commission calculation if possible
-                        liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE, # Bitbank doesn't tell us maker/taker in this API easily
-                        ts_event=self._clock.timestamp_ns(),
-                    )
-                    self._logger.info(f"Order fill reported: {fill_qty} @ {avg_price}")
+                    # Fetch detailed trade history to get fee and maker/taker
+                    try:
+                        trades_resp = await self._client.get_trade_history_py(pair, str(venue_order_id))
+                        trades_data = json.loads(trades_resp)
+                        trades = trades_data.get("trades", [])
+                        
+                        # Sort trades by ID or time to process them in order
+                        # Bitbank usually returns desc? Let's check or just iterate.
+                        for tx in sorted(trades, key=lambda x: x["trade_id"]):
+                            tx_id = str(tx["trade_id"])
+                            if tx_id in reported_trade_ids:
+                                continue
+                            
+                            tx_qty = Decimal(tx["amount"])
+                            tx_px = Decimal(tx["price"])
+                            tx_fee = Decimal(tx["fee_amount_quote"])
+                            tx_mt = tx.get("maker_taker")
+                            
+                            l_side = LiquiditySide.NO_LIQUIDITY_SIDE
+                            if tx_mt == "maker":
+                                l_side = LiquiditySide.MAKER
+                            elif tx_mt == "taker":
+                                l_side = LiquiditySide.TAKER
+                            
+                            # Generate Fill Report for THIS specific trade
+                            self.generate_order_filled(
+                                strategy_id=order.strategy_id,
+                                instrument_id=order.instrument_id,
+                                client_order_id=order.client_order_id,
+                                venue_order_id=venue_order_id,
+                                venue_position_id=None,
+                                trade_id=TradeId(tx_id),
+                                order_side=order.side,
+                                order_type=order.order_type,
+                                last_qty=tx_qty,
+                                last_px=tx_px,
+                                quote_currency=quote_currency,
+                                commission=Money(tx_fee, quote_currency),
+                                liquidity_side=l_side,
+                                ts_event=int(tx["executed_at"]) * 1_000_000,
+                            )
+                            reported_trade_ids.add(tx_id)
+                            self._logger.info(f"Order fill reported (trade {tx_id}): {tx_qty} @ {tx_px} ({tx_mt}, fee={tx_fee})")
+                            
+                        last_executed_qty = executed_qty
+
+                    except Exception as te:
+                        self._logger.warning(f"Failed to fetch trade history for details: {te}")
+                        # Fallback: if we can't get history, at least report the aggregate fill
+                        fill_qty = executed_qty - last_executed_qty
+                        self.generate_order_filled(
+                            strategy_id=order.strategy_id,
+                            instrument_id=order.instrument_id,
+                            client_order_id=order.client_order_id,
+                            venue_order_id=venue_order_id,
+                            venue_position_id=None,
+                            trade_id=TradeId(f"BB-{venue_order_id}-{self._clock.timestamp_ns()}"),
+                            order_side=order.side,
+                            order_type=order.order_type,
+                            last_qty=fill_qty,
+                            last_px=avg_price,
+                            quote_currency=quote_currency,
+                            commission=Money(0, quote_currency),
+                            liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+                            ts_event=self._clock.timestamp_ns(),
+                        )
+                        last_executed_qty = executed_qty
+                        self._logger.info(f"Order fill reported (aggregate fallback): {fill_qty} @ {avg_price}")
 
                 # Check if order is finished
                 if status in ("FULLY_FILLED", "CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED"):

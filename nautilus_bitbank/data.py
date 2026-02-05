@@ -4,21 +4,19 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 
+from decimal import Decimal
 from nautilus_trader.live.data_client import LiveDataClient
 from nautilus_trader.model.instruments import Instrument
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue, ClientId, TradeId
 from nautilus_trader.model.data import QuoteTick, DataType
-from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.objects import Price, Quantity, Money
+from nautilus_trader.model.enums import LiquiditySide
 from .config import BitbankDataClientConfig
-
 
 try:
     from . import _nautilus_bitbank as bitbank
 except ImportError:
-    # Fallback or dev handling
     import _nautilus_bitbank as bitbank
-
-from nautilus_trader.model.identifiers import Venue, ClientId
 
 class BitbankDataClient(LiveDataClient):
     def __init__(self, loop, config: BitbankDataClientConfig, msgbus, cache, clock):
@@ -165,7 +163,7 @@ class BitbankDataClient(LiveDataClient):
             return
 
         from nautilus_trader.model.data import TradeTick
-        from nautilus_trader.model.enums import TradeSide
+        from nautilus_trader.model.enums import AggressorSide
 
         transactions = data.get("transactions", [])
         
@@ -176,7 +174,7 @@ class BitbankDataClient(LiveDataClient):
             ts_event = int(tx.get("executed_at", 0)) * 1_000_000
             
             if price and amount:
-                side = TradeSide.BUY if side_str == "buy" else TradeSide.SELL
+                side = AggressorSide.BUY if side_str == "buy" else AggressorSide.SELL
                 
                 tick = TradeTick(
                     instrument_id=instrument.id,
@@ -223,6 +221,59 @@ class BitbankDataClient(LiveDataClient):
             
             self._logger.info(f"TICKER {instrument.id}: Last={data.get('last')} @ {ts_event}")
             
+    async def fetch_instruments(self) -> List[Instrument]:
+        """Fetch all available currency pairs from Bitbank."""
+        from nautilus_trader.model.instruments import CryptoInstrument
+        from nautilus_trader.model.currencies import Currency
+        from nautilus_trader.model.enums import AssetType
+        
+        try:
+            resp_json = await self._rest_client.get_pairs_py()
+            data = json.loads(resp_json)
+            pairs = data.get("pairs", [])
+            
+            instruments = []
+            for p in pairs:
+                if p.get("is_suspended"):
+                    continue
+                
+                name = p["name"] # e.g. btc_jpy
+                base_asset = p["base_asset"].upper()
+                quote_asset = p["quote_asset"].upper()
+                
+                # Convert btc_jpy -> BTC/JPY
+                symbol = f"{base_asset}/{quote_asset}"
+                
+                inst = CryptoInstrument(
+                    instrument_id=InstrumentId.from_str(f"{symbol}.{self.venue.value}"),
+                    raw_symbol=Symbol(name),
+                    base_currency=Currency.from_str(base_asset),
+                    quote_currency=Currency.from_str(quote_asset),
+                    price_precision=p["price_digits"],
+                    size_precision=p["amount_digits"],
+                    price_increment=Price.from_str(p["limit_unit_amount"]),
+                    size_increment=Quantity.from_str(p["unit_amount"]),
+                    lot_size=Quantity.from_str("1"),
+                    max_quantity=Quantity.from_str(p["max_amount"]),
+                    min_quantity=Quantity.from_str(p["min_amount"]),
+                    max_notional=None,
+                    min_notional=None,
+                    margins=False,
+                    is_inverse=False,
+                    maker_fee=Decimal(p["maker_fee_rate"]),
+                    taker_fee=Decimal(p["taker_fee_rate"]),
+                    ts_event=self._clock.timestamp_ns(),
+                    ts_init=self._clock.timestamp_ns(),
+                )
+                instruments.append(inst)
+            
+            self._logger.info(f"Fetched {len(instruments)} instruments from Bitbank")
+            return instruments
+            
+        except Exception as e:
+            self._logger.error(f"Failed to fetch instruments: {e}")
+            return []
+
     # For testing from test_adapter.py (legacy)
     async def fetch_ticker(self, instrument_id: str):
         symbol = instrument_id.split(".")[0]

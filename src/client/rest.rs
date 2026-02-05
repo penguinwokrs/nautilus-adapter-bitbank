@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
 use crate::error::BitbankError;
-use crate::model::{BitbankResponse, BitbankErrorResponse, market_data::{Ticker, Depth}, order::Order};
+use crate::model::{BitbankResponse, BitbankErrorResponse, market_data::{Ticker, Depth, PairsContainer}, order::{Order, Trades}};
 use std::time::{SystemTime, UNIX_EPOCH};
 use pyo3::prelude::*;
 
@@ -87,6 +87,37 @@ impl BitbankRestClient {
             let order_id_u64 = order_id.parse::<u64>().map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid order_id: {}", e)))?;
             
             let res = client.get_order(&pair, order_id_u64)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                
+            let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+            Ok(json)
+        };
+        pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
+    }
+
+    pub fn get_trade_history_py(&self, py: Python, pair: String, order_id: Option<String>) -> PyResult<PyObject> {
+        let client = self.clone();
+        let future = async move {
+            let order_id_u64 = match order_id {
+                Some(id) => Some(id.parse::<u64>().map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid order_id: {}", e)))?),
+                None => None,
+            };
+            
+            let res = client.get_trade_history(&pair, order_id_u64)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                
+            let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+            Ok(json)
+        };
+        pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
+    }
+
+    pub fn get_pairs_py(&self, py: Python) -> PyResult<PyObject> {
+        let client = self.clone();
+        let future = async move {
+            let res = client.get_pairs()
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
                 
@@ -206,6 +237,11 @@ impl BitbankRestClient {
         self.request(Method::GET, &endpoint, None, None, false).await
     }
 
+    pub async fn get_pairs(&self) -> Result<PairsContainer, BitbankError> {
+        let endpoint = "/v1/spot/pairs";
+        self.request(Method::GET, endpoint, None, None, false).await
+    }
+
     // Keep all other methods as previously defined
     pub async fn get_depth(&self, pair: &str) -> Result<Depth, BitbankError> {
         let endpoint = format!("/{}/depth", pair);
@@ -253,5 +289,18 @@ impl BitbankRestClient {
         ];
         
         self.request(Method::GET, endpoint, Some(&query), None, true).await
+    }
+
+    pub async fn get_trade_history(&self, pair: &str, order_id: Option<u64>) -> Result<Trades, BitbankError> {
+        let endpoint = "/v1/user/spot/trade_history";
+        let mut query = vec![("pair", pair.to_string())];
+        if let Some(id) = order_id {
+            query.push(("order_id", id.to_string()));
+        }
+        
+        // Convert Vec<(String, String)> to &[(&str, &str)]
+        let query_refs: Vec<(&str, &str)> = query.iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect();
+
+        self.request::<Trades>(Method::GET, endpoint, Some(&query_refs), None, true).await
     }
 }
