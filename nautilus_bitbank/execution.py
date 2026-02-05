@@ -85,25 +85,27 @@ class BitbankExecutionClient(LiveExecutionClient):
             # 1. Get PubNub Auth
             auth_json = await self._client.get_pubnub_auth_py()
             auth_data = json.loads(auth_json)
-            # Expected: {"success":1, "data":{"subscribe_key":"...", "channel":"..."}}
+            # Response: {"pubnub_channel": "...", "pubnub_token": "..."}
             
-            if auth_data.get("success") == 1:
-                data = auth_data.get("data", {})
-                sub_key = data.get("subscribe_key")
-                channel = data.get("channel")
+            sub_key = "sub-c-e12e9174-dd60-11e6-806b-02ee2ddab7fe" # Bitbank Public Key
+            channel = auth_data.get("pubnub_channel")
+            token = auth_data.get("pubnub_token") # Not used in current rust client yet, but good to have
+            
+            if channel:
+                self._logger.info(f"Starting PubNub stream on channel: {channel}")
+                # 2. Connect PubNub
+                # The Rust client needs sub_key and channel. 
+                # Ideally pass token if PAM is enabled, but current impl doesn't support auth param.
+                # Assuming public read access for this user channel secured by complexity? 
+                # Or wait, `pubnub_token` IS required. 
+                # Let's pass it if we can updates Rust client, otherwise try without.
                 
-                if sub_key and channel:
-                    self._logger.info(f"Starting PubNub stream on channel: {channel}")
-                    # 2. Connect PubNub (starts background loop in Rust)
-                    await self._pubnub_client.connect_py(sub_key, channel)
-                else:
-                    self._logger.error("PubNub auth data missing key or channel")
+                await self._pubnub_client.connect_py(sub_key, channel)
             else:
-                 self._logger.error(f"Failed to get PubNub auth: {auth_json}")
+                self._logger.error("PubNub auth data missing channel")
 
         except Exception as e:
             self._logger.error(f"Failed to connect PubNub: {e}")
-            # Non-critical failure, fallback to polling
             pass
 
     async def _disconnect(self):

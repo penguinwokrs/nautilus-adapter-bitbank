@@ -131,9 +131,30 @@ impl BitbankRestClient {
         let client = self.clone();
         let future = async move {
              let endpoint = "/v1/user/subscribe";
-             let res: PubNubConnectParams = client.request(Method::GET, endpoint, None, None, true)
+             let url = format!("{}{}", client.base_url_private, endpoint);
+             
+             let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .to_string();
+             
+             let text_to_sign = format!("{}{}", timestamp, endpoint);
+             let signature = client.generate_signature(&text_to_sign);
+
+             let response = client.client.get(&url)
+                .header("ACCESS-KEY", &client.api_key)
+                .header("ACCESS-NONCE", &timestamp)
+                .header("ACCESS-SIGNATURE", signature)
+                .send()
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+             let text = response.text().await.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+             // println!("Raw PubNub Resp: {}", text);
+
+             let res: PubNubConnectParams = serde_json::from_str(&text)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse Error: {}", e)))?;
 
              let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
              Ok(json)
