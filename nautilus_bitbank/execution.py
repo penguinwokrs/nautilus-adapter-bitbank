@@ -16,12 +16,6 @@ from nautilus_trader.model.enums import (
     OmsType,
     AccountType,
 )
-from nautilus_trader.model.events import (
-    OrderAccepted,
-    OrderRejected,
-    OrderCanceled,
-    OrderCancelRejected,
-)
 from nautilus_trader.execution.messages import (
     SubmitOrder,
     CancelOrder,
@@ -137,23 +131,17 @@ class BitbankExecutionClient(LiveExecutionClient):
             # resp is the order object from Bitbank
             # {"order_id": 12345, ...}
             
-            venue_order_id = str(resp.get("order_id"))
+            from nautilus_trader.model.identifiers import VenueOrderId
+            venue_order_id = VenueOrderId(str(resp.get("order_id")))
             
-            # Publish OrderAccepted
-            # We need to create an event with correct matching IDs
-            # The base class or `Cache` tracks orders.
-            # We should publish `OrderAccepted`
-            
-            report = OrderAccepted(
+            # Use the proper API to generate OrderAccepted event
+            self.generate_order_accepted(
+                strategy_id=command.strategy_id,
                 instrument_id=command.instrument_id,
                 client_order_id=command.client_order_id,
                 venue_order_id=venue_order_id,
-                account_id=self.account_id, # Optional?
-                event_id=self._clock.timestamp_ns(), # using unique ID ideally
                 ts_event=self._clock.timestamp_ns(),
-                ts_init=self._clock.timestamp_ns(),
             )
-            self._msgbus.publish(report)
             self._logger.info(f"Order accepted: {venue_order_id}")
 
         except Exception as e:
@@ -176,46 +164,41 @@ class BitbankExecutionClient(LiveExecutionClient):
             
             self._logger.info(f"Cancelling order: {venue_order_id}")
             
-            await self._client.cancel_order_py(pair, venue_order_id)
+            await self._client.cancel_order_py(pair, str(command.venue_order_id))
             
-            # Publish OrderCanceled
-            report = OrderCanceled(
+            # Use the proper API to generate OrderCanceled event
+            from nautilus_trader.model.identifiers import VenueOrderId
+            self.generate_order_canceled(
+                strategy_id=command.strategy_id,
                 instrument_id=command.instrument_id,
                 client_order_id=command.client_order_id,
-                venue_order_id=venue_order_id,
-                account_id=self.account_id,
-                event_id=self._clock.timestamp_ns(),
+                venue_order_id=command.venue_order_id if isinstance(command.venue_order_id, VenueOrderId) else VenueOrderId(str(command.venue_order_id)),
                 ts_event=self._clock.timestamp_ns(),
-                ts_init=self._clock.timestamp_ns(),
             )
-            self._msgbus.publish(report)
-            self._logger.info(f"Order canceled: {venue_order_id}")
+            self._logger.info(f"Order canceled: {command.venue_order_id}")
 
         except Exception as e:
             self._logger.error(f"Cancel failed: {e}")
             self._publish_cancel_reject(command, str(e))
 
     def _publish_reject(self, command: SubmitOrder, reason: str):
-        report = OrderRejected(
+        self.generate_order_rejected(
+            strategy_id=command.strategy_id,
             instrument_id=command.instrument_id,
             client_order_id=command.client_order_id,
-            account_id=self.account_id,
             reason=reason,
-            event_id=self._clock.timestamp_ns(),
             ts_event=self._clock.timestamp_ns(),
-            ts_init=self._clock.timestamp_ns(),
         )
-        self._msgbus.publish(report)
 
     def _publish_cancel_reject(self, command: CancelOrder, reason: str):
-        report = OrderCancelRejected(
+        from nautilus_trader.model.identifiers import VenueOrderId
+        venue_order_id = command.venue_order_id if isinstance(command.venue_order_id, VenueOrderId) else VenueOrderId(str(command.venue_order_id)) if command.venue_order_id else VenueOrderId("UNKNOWN")
+        self.generate_order_cancel_rejected(
+            strategy_id=command.strategy_id,
             instrument_id=command.instrument_id,
             client_order_id=command.client_order_id,
-            venue_order_id=command.venue_order_id,
-            account_id=self.account_id,
+            venue_order_id=venue_order_id,
             reason=reason,
-            event_id=self._clock.timestamp_ns(),
             ts_event=self._clock.timestamp_ns(),
-            ts_init=self._clock.timestamp_ns(),
         )
-        self._msgbus.publish(report)
+
