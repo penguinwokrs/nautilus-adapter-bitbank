@@ -12,13 +12,15 @@ from nautilus_trader.model.enums import (
     OrderType,
     OrderStatus
 )
-from nautilus_trader.execution.messages import (
+from nautilus_trader.model.events import (
     OrderAccepted,
     OrderRejected,
     OrderCanceled,
     OrderCancelRejected,
-    OrderSubmit,
-    OrderCancel,
+)
+from nautilus_trader.execution.messages import (
+    SubmitOrder,
+    CancelOrder,
 )
 
 from .config import BitbankExecClientConfig
@@ -49,7 +51,7 @@ class BitbankExecutionClient(LiveExecutionClient):
     # The base class defines: `submit_order(self, command: OrderSubmit)`
     # Let's assume OrderSubmit command.
 
-    async def submit_order(self, command: OrderSubmit) -> None:
+    async def submit_order(self, command: SubmitOrder) -> None:
         try:
             instrument_id = command.instrument_id
             # Format: BTC/JPY -> btc_jpy
@@ -118,7 +120,7 @@ class BitbankExecutionClient(LiveExecutionClient):
             self._logger.error(f"Submit failed: {e}")
             self._publish_reject(command, str(e))
 
-    async def cancel_order(self, command: OrderCancel) -> None:
+    async def cancel_order(self, command: CancelOrder) -> None:
         try:
             # We need venue_order_id
             if not command.venue_order_id:
@@ -153,7 +155,7 @@ class BitbankExecutionClient(LiveExecutionClient):
             self._logger.error(f"Cancel failed: {e}")
             self._publish_cancel_reject(command, str(e))
 
-    def _publish_reject(self, command: OrderSubmit, reason: str):
+    def _publish_reject(self, command: SubmitOrder, reason: str):
         report = OrderRejected(
             instrument_id=command.instrument_id,
             client_order_id=command.client_order_id,
@@ -165,7 +167,7 @@ class BitbankExecutionClient(LiveExecutionClient):
         )
         self._msgbus.publish(report)
 
-    def _publish_cancel_reject(self, command: OrderCancel, reason: str):
+    def _publish_cancel_reject(self, command: CancelOrder, reason: str):
         report = OrderCancelRejected(
             instrument_id=command.instrument_id,
             client_order_id=command.client_order_id,
