@@ -16,9 +16,19 @@ except ImportError:
     # Fallback or dev handling
     import _nautilus_bitbank as bitbank
 
+from nautilus_trader.model.identifiers import Venue, ClientId
+
 class BitbankDataClient(LiveDataClient):
     def __init__(self, loop, config: BitbankDataClientConfig, msgbus, cache, clock):
-        super().__init__(loop, config, msgbus, cache, clock)
+        super().__init__(
+            loop=loop, 
+            client_id=ClientId("BITBANK-DATA"),
+            venue=Venue("BITBANK"),
+            msgbus=msgbus, 
+            cache=cache, 
+            clock=clock, 
+            config=config
+        )
         self.config = config
         self._logger = logging.getLogger(__name__)
         
@@ -36,7 +46,7 @@ class BitbankDataClient(LiveDataClient):
         # Map instrument_id (str) -> Instrument
         self._subscribed_instruments: Dict[str, Instrument] = {}
 
-    async def connect(self):
+    async def _connect(self):
         self._logger.info("Connecting to Bitbank WebSocket...")
         try:
             await self._ws_client.connect_py()
@@ -48,7 +58,7 @@ class BitbankDataClient(LiveDataClient):
             self._logger.error(f"Failed to connect: {e}")
             raise
 
-    async def disconnect(self):
+    async def _disconnect(self):
         self._connected = False
         # WS client doesn't have disconnect method exposed yet in Rust, 
         # but dropping it or closing loop usually works. 
@@ -61,7 +71,7 @@ class BitbankDataClient(LiveDataClient):
             # Subscribe to Ticker (as a baseline)
             # Format: BTC/JPY -> btc_jpy
             symbol = instrument.id.symbol
-            pair = symbol.replace("/", "_").lower()
+            pair = symbol.value.replace("/", "_").lower()
             
             room_id = f"ticker_{pair}"
             await self._ws_client.subscribe_py(room_id)
@@ -110,7 +120,7 @@ class BitbankDataClient(LiveDataClient):
         instrument = None
         for inst_id_str, inst in self._subscribed_instruments.items():
             # inst.id.symbol is BTC/JPY
-            if inst.id.symbol.replace("/", "_").lower() == pair:
+            if inst.id.symbol.value.replace("/", "_").lower() == pair:
                 instrument = inst
                 break
         

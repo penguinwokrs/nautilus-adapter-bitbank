@@ -5,12 +5,16 @@ from typing import Dict, List, Optional
 from decimal import Decimal
 
 from nautilus_trader.live.execution_client import LiveExecutionClient
+from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.orders import Order
+from nautilus_trader.model.identifiers import Venue, ClientId
 from nautilus_trader.model.enums import (
     TimeInForce,
     OrderSide,
     OrderType,
-    OrderStatus
+    OrderStatus,
+    OmsType,
+    AccountType,
 )
 from nautilus_trader.model.events import (
     OrderAccepted,
@@ -28,11 +32,24 @@ from .config import BitbankExecClientConfig
 try:
     from . import _nautilus_bitbank as bitbank
 except ImportError:
+    # Fallback or dev handling
     import _nautilus_bitbank as bitbank
 
 class BitbankExecutionClient(LiveExecutionClient):
-    def __init__(self, loop, config: BitbankExecClientConfig, msgbus, cache, clock):
-        super().__init__(loop, config, msgbus, cache, clock)
+    def __init__(self, loop, config: BitbankExecClientConfig, msgbus, cache, clock, instrument_provider: InstrumentProvider):
+        super().__init__(
+            loop=loop,
+            client_id=ClientId("BITBANK-EXEC"),
+            venue=Venue("BITBANK"),
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.CASH,
+            base_currency=None,
+            instrument_provider=instrument_provider,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            config=config,
+        )
         self.config = config
         self._logger = logging.getLogger(__name__)
         
@@ -40,6 +57,21 @@ class BitbankExecutionClient(LiveExecutionClient):
             self.config.api_key or "",
             self.config.api_secret or ""
         )
+
+    async def _connect(self):
+        self._logger.info("BitbankExecutionClient connected")
+
+    async def _disconnect(self):
+        self._logger.info("BitbankExecutionClient disconnected")
+    
+    async def generate_order_status_reports(self, instrument_id=None, client_order_id=None):
+        return []
+
+    async def generate_fill_reports(self, instrument_id=None, client_order_id=None):
+        return []
+
+    async def generate_position_reports(self, instrument_id=None):
+        return []
 
     # Note: LiveExecutionClient methods usually take commands (OrderSubmit, OrderCancel) 
     # OR the abstract methods might be named differently depending on version.
@@ -55,7 +87,7 @@ class BitbankExecutionClient(LiveExecutionClient):
         try:
             instrument_id = command.instrument_id
             # Format: BTC/JPY -> btc_jpy
-            pair = instrument_id.symbol.replace("/", "_").lower()
+            pair = instrument_id.symbol.value.replace("/", "_").lower()
             
             side = "buy" if command.side == OrderSide.BUY else "sell"
             
@@ -130,7 +162,7 @@ class BitbankExecutionClient(LiveExecutionClient):
                 return
 
             instrument_id = command.instrument_id
-            pair = instrument_id.symbol.replace("/", "_").lower()
+            pair = instrument_id.symbol.value.replace("/", "_").lower()
             
             venue_order_id = command.venue_order_id
             
