@@ -69,15 +69,24 @@ impl BitbankRestClient {
     pub fn cancel_order_py(&self, py: Python, pair: String, order_id: String) -> PyResult<PyObject> {
         let client = self.clone();
         let future = async move {
-            // Need to parse order_id to u64 if necessary, but bitbank uses u64 or string?
-            // Bitbank order_id is number. but let's see. The API usually wants `order_id` in JSON body.
-            // My internal `cancel_order` uses u64 likely? Or string?
-            // I'll implement internal `cancel_order` to take &str for flexibility or simple parsing.
-            
-            // Assuming `order_id` comes as string from Python, parse it.
             let order_id_u64 = order_id.parse::<u64>().map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid order_id: {}", e)))?;
             
             let res = client.cancel_order(&pair, order_id_u64)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                
+            let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+            Ok(json)
+        };
+        pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
+    }
+
+    pub fn get_order_py(&self, py: Python, pair: String, order_id: String) -> PyResult<PyObject> {
+        let client = self.clone();
+        let future = async move {
+            let order_id_u64 = order_id.parse::<u64>().map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid order_id: {}", e)))?;
+            
+            let res = client.get_order(&pair, order_id_u64)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
                 
@@ -170,11 +179,25 @@ impl BitbankRestClient {
             return Err(BitbankError::Unknown(format!("Status: {}, Body: {}", status, text)));
         }
 
-        let res: BitbankResponse<T> = serde_json::from_str(&text)?;
-        if res.success == 1 {
-            Ok(res.data)
+        let val: serde_json::Value = serde_json::from_str(&text)?;
+        let success = val.get("success").and_then(|v| v.as_i64()).unwrap_or(0);
+        
+        if success == 1 {
+            if let Some(data) = val.get("data") {
+                let res: T = serde_json::from_value(data.clone())?;
+                Ok(res)
+            } else {
+                Err(BitbankError::Unknown(format!("Success=1 but no data. Body: {}", text)))
+            }
         } else {
-             Err(BitbankError::Unknown(format!("Success=0 but 200 OK. Body: {}", text)))
+             // Handle error info in data
+             if let Some(data) = val.get("data") {
+                 let code = data.get("code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                 let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error").to_string();
+                 Err(BitbankError::ExchangeError { code, message })
+             } else {
+                 Err(BitbankError::Unknown(format!("Success=0 and no data. Body: {}", text)))
+             }
         }
     }
 
@@ -220,5 +243,15 @@ impl BitbankRestClient {
         let body_str = body_json.to_string();
         
         self.request(Method::POST, endpoint, None, Some(&body_str), true).await
+    }
+
+    pub async fn get_order(&self, pair: &str, order_id: u64) -> Result<Order, BitbankError> {
+        let endpoint = "/v1/user/spot/order";
+        let query = [
+            ("pair", pair),
+            ("order_id", &order_id.to_string()),
+        ];
+        
+        self.request(Method::GET, endpoint, Some(&query), None, true).await
     }
 }
