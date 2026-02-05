@@ -48,13 +48,19 @@ class BitbankExecutionClient(LiveExecutionClient):
             config=config,
         )
         self.config = config
+        
+        # Validation for stability
+        if not self.config.api_key or not self.config.api_secret:
+            raise ValueError("BitbankExecutionClient requires both api_key and api_secret")
+            
         self._account_id = AccountId("BITBANK-001")
         self._set_account_id(self._account_id)
         self._logger = logging.getLogger(__name__)
+        self._is_stopped = False
         
         self._client = bitbank.BitbankRestClient(
-            self.config.api_key or "",
-            self.config.api_secret or ""
+            self.config.api_key,
+            self.config.api_secret
         )
 
     @property
@@ -65,6 +71,7 @@ class BitbankExecutionClient(LiveExecutionClient):
         self._logger.info("BitbankExecutionClient connected")
 
     async def _disconnect(self):
+        self._is_stopped = True
         self._logger.info("BitbankExecutionClient disconnected")
     
     async def generate_order_status_reports(self, instrument_id=None, client_order_id=None):
@@ -177,9 +184,11 @@ class BitbankExecutionClient(LiveExecutionClient):
         quote_currency_code = instrument_id.symbol.value.split("/")[-1]
         quote_currency = Currency.from_str(quote_currency_code)
 
-        while True:
+        while not self._is_stopped:
             try:
-                await asyncio.sleep(2)  # Adjust polling interval as needed
+                await asyncio.sleep(2)
+                if self._is_stopped:
+                    break
                 
                 resp_json = await self._client.get_order_py(pair, str(venue_order_id))
                 order_data = json.loads(resp_json)

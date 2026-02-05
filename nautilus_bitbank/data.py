@@ -30,12 +30,17 @@ class BitbankDataClient(LiveDataClient):
             config=config
         )
         self.config = config
+        
+        # Validation for stability
+        if not self.config.api_key or not self.config.api_secret:
+            raise ValueError("BitbankDataClient requires both api_key and api_secret")
+            
         self._logger = logging.getLogger(__name__)
         
         # REST Client for snapshot/initial data if needed
         self._rest_client = bitbank.BitbankRestClient(
-            self.config.api_key or "", 
-            self.config.api_secret or ""
+            self.config.api_key,
+            self.config.api_secret
         )
         
         # WebSocket Client
