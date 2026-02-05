@@ -150,8 +150,18 @@ class BitbankExecutionClient(LiveExecutionClient):
 
         except Exception as e:
             err_msg = str(e)
-            if "60001" in err_msg:
-                err_msg = "Insufficient funds (Bitbank 60001)"
+            # Map Bitbank error codes to readable reasons
+            if "60001" in err_msg or "50003" in err_msg:
+                err_msg = "Insufficient funds (Bitbank)"
+            elif "40001" in err_msg:
+                err_msg = "Order amount is too small (Bitbank)"
+            elif "40007" in err_msg:
+                err_msg = "Order price is out of range (Bitbank)"
+            elif "20001" in err_msg:
+                err_msg = "Authentication failed (Bitbank)"
+            elif "10000" in err_msg:
+                err_msg = "Internal error (Bitbank)"
+
             self._logger.error(f"Submit failed: {err_msg}")
             self._publish_reject(command, err_msg)
 

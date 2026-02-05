@@ -53,45 +53,50 @@ class BitbankDataClient(LiveDataClient):
         try:
             await self._ws_client.connect_py()
             self._connected = True
-            # LiveDataClient parent usually handles CONNECTED state via signals/events
-            # For now just log
             self._logger.info("Connected to Bitbank WebSocket")
+            
+            # Re-subscribe and handle existing subscriptions if any
+            if self._subscribed_instruments:
+                await self.subscribe(list(self._subscribed_instruments.values()))
+                
         except Exception as e:
             self._logger.error(f"Failed to connect: {e}")
-            raise
+            # Do not raise here, allow connection handler to retry
+            self._connected = False
 
     async def _disconnect(self):
         self._connected = False
-        # WS client doesn't have disconnect method exposed yet in Rust, 
-        # but dropping it or closing loop usually works. 
         self._logger.info("Disconnected")
 
     async def subscribe(self, instruments: List[Instrument]):
         for instrument in instruments:
             self._subscribed_instruments[instrument.id.value] = instrument
             
-            # Subscribe to Ticker (as a baseline)
-            # Format: BTC/JPY -> btc_jpy
             symbol = instrument.id.symbol
             pair = symbol.value.replace("/", "_").lower()
             
-            room_id = f"ticker_{pair}"
-            await self._ws_client.subscribe_py(room_id)
-            self._logger.info(f"Subscribed to {room_id}")
+            # Subscribe to Ticker
+            await self._ws_client.subscribe_py(f"ticker_{pair}")
+            
+            # Subscribe to Transactions (TradeTicks)
+            await self._ws_client.subscribe_py(f"transactions_{pair}")
+            
+            # Subscribe to Depth (OrderBook) - using depth_whole for simple full snapshot updates
+            await self._ws_client.subscribe_py(f"depth_whole_{pair}")
+            
+            self._logger.info(f"Subscribed to ticker, transactions and depth for {pair}")
 
     async def unsubscribe(self, instruments: List[Instrument]):
         # Unsubscribe implementation would go here
         pass
 
     def _handle_message(self, msg: str):
-        # Format: 42["message",{"room_name":"...","message":{...}}]
         try:
             if not msg.startswith("42"):
                 return
             
             payload_str = msg[2:]
             data_arr = json.loads(payload_str)
-            # data_arr: ["message", { ... }]
             
             if not isinstance(data_arr, list) or len(data_arr) < 2:
                 return
@@ -110,21 +115,89 @@ class BitbankDataClient(LiveDataClient):
 
             if room_name.startswith("ticker_"):
                 self._handle_ticker(room_name, data)
+            elif room_name.startswith("transactions_"):
+                self._handle_transactions(room_name, data)
+            elif room_name.startswith("depth_whole_"):
+                self._handle_depth(room_name, data)
                 
         except Exception as e:
             self._logger.error(f"Error handling message: {e} | Msg: {msg}")
 
+    def _handle_depth(self, room_name: str, data: dict):
+        pair = room_name.replace("depth_whole_", "")
+        instrument = self._find_instrument(pair)
+        
+        if not instrument:
+            return
+
+        from nautilus_trader.model.data import OrderBookUpdate
+        
+        # Bitbank depth_whole data: {"bids": [["price", "amount"], ...], "asks": [...], "timestamp": ...}
+        bids_raw = data.get("bids", [])
+        asks_raw = data.get("asks", [])
+        ts_event = int(data.get("timestamp", 0)) * 1_000_000
+        
+        # For a full snapshot in Nautilus, we can send it as an OrderBookUpdate
+        # Note: In production, incremental updates (depth) are better for performance, 
+        # but depth_whole is easier for a start.
+        
+        bids = [(Price.from_str(b[0]), Quantity.from_str(b[1])) for b in bids_raw]
+        asks = [(Price.from_str(a[0]), Quantity.from_str(a[1])) for a in asks_raw]
+        
+        # Sort bids descending, asks ascending (Nautilus expects this)
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
+
+        update = OrderBookUpdate(
+            instrument_id=instrument.id,
+            bids=bids,
+            asks=asks,
+            ts_event=ts_event,
+            ts_init=self._clock.timestamp_ns(),
+        )
+        self._handle_data(update)
+
+    def _handle_transactions(self, room_name: str, data: dict):
+        pair = room_name.replace("transactions_", "")
+        instrument = self._find_instrument(pair)
+        
+        if not instrument:
+            return
+
+        from nautilus_trader.model.data import TradeTick
+        from nautilus_trader.model.enums import TradeSide
+
+        transactions = data.get("transactions", [])
+        
+        for tx in transactions:
+            side_str = tx.get("side")
+            price = tx.get("price")
+            amount = tx.get("amount")
+            ts_event = int(tx.get("executed_at", 0)) * 1_000_000
+            
+            if price and amount:
+                side = TradeSide.BUY if side_str == "buy" else TradeSide.SELL
+                
+                tick = TradeTick(
+                    instrument_id=instrument.id,
+                    price=Price.from_str(price),
+                    size=Quantity.from_str(amount),
+                    side=side,
+                    ts_event=ts_event,
+                    ts_init=self._clock.timestamp_ns(),
+                )
+                self._handle_data(tick)
+        
+    def _find_instrument(self, pair: str) -> Optional[Instrument]:
+        for inst in self._subscribed_instruments.values():
+            if inst.id.symbol.value.replace("/", "_").lower() == pair:
+                return inst
+        return None
+
     def _handle_ticker(self, room_name: str, data: dict):
         # Extract pair from room_name: ticker_btc_jpy
         pair = room_name.replace("ticker_", "")
-        # Find matching instrument
-        # This is inefficient 0(N), optimization needed later
-        instrument = None
-        for inst_id_str, inst in self._subscribed_instruments.items():
-            # inst.id.symbol is BTC/JPY
-            if inst.id.symbol.value.replace("/", "_").lower() == pair:
-                instrument = inst
-                break
+        instrument = self._find_instrument(pair)
         
         if instrument:
             # Parse data
