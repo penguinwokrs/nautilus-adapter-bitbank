@@ -145,8 +145,17 @@ class BitbankExecutionClient(LiveExecutionClient):
             # Only log for now until we implement event generation
             # self._logger.info(f"PubNub Message: {data}")
             
-            # TODO: Parse order update and call generate_order_filled / generate_order_status
-            pass
+            # Parse order update
+            if status_str in ("FILLED", "PARTIALLY_FILLED", "CANCELED_PARTIALLY_FILLED", "FULLY_FILLED"):
+                 # Trigger immediate update logic
+                 order = self._active_orders.get(venue_order_id)
+                 if order:
+                     instrument_id = order.instrument_id
+                     pair = instrument_id.symbol.value.replace("/", "_").lower()
+                     quote_currency_code = instrument_id.symbol.value.split("/")[-1]
+                     quote_currency = Currency.from_str(quote_currency_code)
+                     
+                     self.create_task(self._process_order_update(order, VenueOrderId(venue_order_id), pair, quote_currency))
         except Exception as e:
             self._logger.error(f"Error handling PubNub message: {e}")
 
@@ -233,13 +242,15 @@ class BitbankExecutionClient(LiveExecutionClient):
         """Poll Bitbank API for order status and report fills."""
         instrument_id = order.instrument_id
         pair = instrument_id.symbol.value.replace("/", "_").lower()
-        last_executed_qty = Decimal("0")
-        reported_trade_ids = set()
-        
-        # Determine quote currency for Money objects
-        # e.g. BTC/JPY -> JPY
         quote_currency_code = instrument_id.symbol.value.split("/")[-1]
         quote_currency = Currency.from_str(quote_currency_code)
+
+        # Initialize state
+        if str(venue_order_id) not in self._order_states:
+             self._order_states[str(venue_order_id)] = {
+                 "last_executed_qty": Decimal("0"),
+                 "reported_trades": set()
+             }
 
         while not self._is_stopped:
             try:
@@ -247,66 +258,86 @@ class BitbankExecutionClient(LiveExecutionClient):
                 if self._is_stopped:
                     break
                 
-                resp_json = await self._client.get_order_py(pair, str(venue_order_id))
-                order_data = json.loads(resp_json)
-                
-                status = order_data.get("status")
-                executed_qty = Decimal(order_data.get("executed_amount", "0"))
-                avg_price_str = order_data.get("average_price", "0")
-                avg_price = Decimal(avg_price_str if avg_price_str and avg_price_str != "0" else "0")
+                is_closed = await self._process_order_update(order, venue_order_id, pair, quote_currency)
+                if is_closed:
+                    self._logger.info(f"Order polling finished for {venue_order_id}")
+                    if str(venue_order_id) in self._active_orders:
+                        del self._active_orders[str(venue_order_id)]
+                    break
 
-                # Check for new fills
-                if executed_qty > last_executed_qty:
-                    # Fetch detailed trade history to get fee and maker/taker
-                    try:
-                        trades_resp = await self._client.get_trade_history_py(pair, str(venue_order_id))
-                        trades_data = json.loads(trades_resp)
-                        trades = trades_data.get("trades", [])
+            except Exception as e:
+                self._logger.error(f"Error polling order {venue_order_id}: {e}")
+                await asyncio.sleep(5)  # Wait longer on error
+
+    async def _process_order_update(self, order: Order, venue_order_id: VenueOrderId, pair: str, quote_currency: Currency) -> bool:
+        """Fetch order status details and emit Nautilus events. Returns True if order is closed."""
+        try:
+            state = self._order_states.get(str(venue_order_id))
+            if not state:
+                 return False
+
+            resp_json = await self._client.get_order_py(pair, str(venue_order_id))
+            order_data = json.loads(resp_json)
+            
+            status = order_data.get("status")
+            executed_qty = Decimal(order_data.get("executed_amount", "0"))
+            avg_price_str = order_data.get("average_price", "0")
+            avg_price = Decimal(avg_price_str if avg_price_str and avg_price_str != "0" else "0")
+
+            last_executed_qty = state["last_executed_qty"]
+            reported_trade_ids = state["reported_trades"]
+
+            # Check for new fills
+            if executed_qty > last_executed_qty:
+                # Fetch detailed trade history to get fee and maker/taker
+                try:
+                    trades_resp = await self._client.get_trade_history_py(pair, str(venue_order_id))
+                    trades_data = json.loads(trades_resp)
+                    trades = trades_data.get("trades", [])
+                    
+                    for tx in sorted(trades, key=lambda x: x["trade_id"]):
+                        tx_id = str(tx["trade_id"])
+                        if tx_id in reported_trade_ids:
+                            continue
                         
-                        # Sort trades by ID or time to process them in order
-                        # Bitbank usually returns desc? Let's check or just iterate.
-                        for tx in sorted(trades, key=lambda x: x["trade_id"]):
-                            tx_id = str(tx["trade_id"])
-                            if tx_id in reported_trade_ids:
-                                continue
-                            
-                            tx_qty = Decimal(tx["amount"])
-                            tx_px = Decimal(tx["price"])
-                            tx_fee = Decimal(tx["fee_amount_quote"])
-                            tx_mt = tx.get("maker_taker")
-                            
-                            l_side = LiquiditySide.NO_LIQUIDITY_SIDE
-                            if tx_mt == "maker":
-                                l_side = LiquiditySide.MAKER
-                            elif tx_mt == "taker":
-                                l_side = LiquiditySide.TAKER
-                            
-                            # Generate Fill Report for THIS specific trade
-                            self.generate_order_filled(
-                                strategy_id=order.strategy_id,
-                                instrument_id=order.instrument_id,
-                                client_order_id=order.client_order_id,
-                                venue_order_id=venue_order_id,
-                                venue_position_id=None,
-                                trade_id=TradeId(tx_id),
-                                order_side=order.side,
-                                order_type=order.order_type,
-                                last_qty=tx_qty,
-                                last_px=tx_px,
-                                quote_currency=quote_currency,
-                                commission=Money(tx_fee, quote_currency),
-                                liquidity_side=l_side,
-                                ts_event=int(tx["executed_at"]) * 1_000_000,
-                            )
-                            reported_trade_ids.add(tx_id)
-                            self._logger.info(f"Order fill reported (trade {tx_id}): {tx_qty} @ {tx_px} ({tx_mt}, fee={tx_fee})")
-                            
-                        last_executed_qty = executed_qty
+                        tx_qty = Decimal(tx["amount"])
+                        tx_px = Decimal(tx["price"])
+                        tx_fee = Decimal(tx["fee_amount_quote"])
+                        tx_mt = tx.get("maker_taker")
+                        
+                        l_side = LiquiditySide.NO_LIQUIDITY_SIDE
+                        if tx_mt == "maker":
+                            l_side = LiquiditySide.MAKER
+                        elif tx_mt == "taker":
+                            l_side = LiquiditySide.TAKER
+                        
+                        # Generate Fill Report
+                        self.generate_order_filled(
+                            strategy_id=order.strategy_id,
+                            instrument_id=order.instrument_id,
+                            client_order_id=order.client_order_id,
+                            venue_order_id=venue_order_id,
+                            venue_position_id=None,
+                            trade_id=TradeId(tx_id),
+                            order_side=order.side,
+                            order_type=order.order_type,
+                            last_qty=tx_qty,
+                            last_px=tx_px,
+                            quote_currency=quote_currency,
+                            commission=Money(tx_fee, quote_currency),
+                            liquidity_side=l_side,
+                            ts_event=int(tx["executed_at"]) * 1_000_000,
+                        )
+                        reported_trade_ids.add(tx_id)
+                        self._logger.info(f"Order fill reported (trade {tx_id}): {tx_qty} @ {tx_px} ({tx_mt}, fee={tx_fee})")
+                        
+                    state["last_executed_qty"] = executed_qty
 
-                    except Exception as te:
-                        self._logger.warning(f"Failed to fetch trade history for details: {te}")
-                        # Fallback: if we can't get history, at least report the aggregate fill
-                        fill_qty = executed_qty - last_executed_qty
+                except Exception as te:
+                    self._logger.warning(f"Failed to fetch trade history for details: {te}")
+                    # Fallback (Aggregate)
+                    fill_qty = executed_qty - last_executed_qty
+                    if fill_qty > 0:
                         self.generate_order_filled(
                             strategy_id=order.strategy_id,
                             instrument_id=order.instrument_id,
@@ -323,26 +354,26 @@ class BitbankExecutionClient(LiveExecutionClient):
                             liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
                             ts_event=self._clock.timestamp_ns(),
                         )
-                        last_executed_qty = executed_qty
+                        state["last_executed_qty"] = executed_qty
                         self._logger.info(f"Order fill reported (aggregate fallback): {fill_qty} @ {avg_price}")
 
-                # Check if order is finished
-                if status in ("FULLY_FILLED", "CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED"):
-                    if status.startswith("CANCELED"):
-                        # We only report cancel if not already handled by cancel_order method
-                        self.generate_order_canceled(
-                            strategy_id=order.strategy_id,
-                            instrument_id=order.instrument_id,
-                            client_order_id=order.client_order_id,
-                            venue_order_id=venue_order_id,
-                            ts_event=self._clock.timestamp_ns(),
-                        )
-                    self._logger.info(f"Order polling finished for {venue_order_id} with status {status}")
-                    break
+            # Check if order is finished
+            if status in ("FULLY_FILLED", "CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED"):
+                if status.startswith("CANCELED"):
+                    self.generate_order_canceled(
+                        strategy_id=order.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=venue_order_id,
+                        ts_event=self._clock.timestamp_ns(),
+                    )
+                return True
+                
+            return False
 
-            except Exception as e:
-                self._logger.error(f"Error polling order {venue_order_id}: {e}")
-                await asyncio.sleep(5)  # Wait longer on error
+        except Exception as e:
+            self._logger.error(f"Error processing update for {venue_order_id}: {e}")
+            return False
 
     def cancel_order(self, command: CancelOrder) -> None:
         self.create_task(self._cancel_order(command))
