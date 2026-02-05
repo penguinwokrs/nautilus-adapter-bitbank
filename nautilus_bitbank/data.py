@@ -7,6 +7,8 @@ from datetime import datetime
 from nautilus_trader.live.data_client import LiveDataClient
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.data import QuoteTick, DataType
+from nautilus_trader.model.objects import Price, Quantity
 from .config import BitbankDataClientConfig
 
 
@@ -127,12 +129,26 @@ class BitbankDataClient(LiveDataClient):
         if instrument:
             # Parse data
             # {"sell":"11339506","buy":"11337274","open":"...","high":"...","low":"...","last":"...","vol":"...","timestamp":1770258493976}
-            # For LiveDataClient, we would normally use self._msgbus to publish QuoteTick or TradeTick.
-            # Since this is initial impl, logging is fine.
-            last_price = data.get("last")
-            timestamp = data.get("timestamp")
+            ask_price = data.get("sell")
+            bid_price = data.get("buy")
+            # timestamp is in ms, convert to ns
+            ts_event = int(data.get("timestamp", 0)) * 1_000_000
             
-            self._logger.info(f"TICKER {instrument.id}: Last={last_price} @ {timestamp}")
+            if ask_price and bid_price:
+                quote = QuoteTick(
+                    instrument_id=instrument.id,
+                    bid_price=Price.from_str(bid_price),
+                    ask_price=Price.from_str(ask_price),
+                    bid_size=Quantity.from_str("0"), # bitbank ticker doesn't provide size
+                    ask_size=Quantity.from_str("0"),
+                    ts_event=ts_event,
+                    ts_init=self._clock.timestamp_ns(),
+                )
+                # Use _handle_data to properly route through DataEngine to Cache
+                self._handle_data(quote)
+                self._logger.debug(f"Handled QuoteTick for {instrument.id}: {bid_price}/{ask_price}")
+            
+            self._logger.info(f"TICKER {instrument.id}: Last={data.get('last')} @ {ts_event}")
             
     # For testing from test_adapter.py (legacy)
     async def fetch_ticker(self, instrument_id: str):

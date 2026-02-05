@@ -7,7 +7,7 @@ from decimal import Decimal
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.orders import Order
-from nautilus_trader.model.identifiers import Venue, ClientId
+from nautilus_trader.model.identifiers import Venue, ClientId, AccountId
 from nautilus_trader.model.enums import (
     TimeInForce,
     OrderSide,
@@ -51,12 +51,17 @@ class BitbankExecutionClient(LiveExecutionClient):
             config=config,
         )
         self.config = config
+        self._account_id = AccountId("BITBANK-001")
         self._logger = logging.getLogger(__name__)
         
         self._client = bitbank.BitbankRestClient(
             self.config.api_key or "",
             self.config.api_secret or ""
         )
+
+    @property
+    def account_id(self) -> AccountId:
+        return self._account_id
 
     async def _connect(self):
         self._logger.info("BitbankExecutionClient connected")
@@ -71,6 +76,9 @@ class BitbankExecutionClient(LiveExecutionClient):
         return []
 
     async def generate_position_reports(self, instrument_id=None):
+        return []
+
+    async def generate_position_status_reports(self, instrument_id=None):
         return []
 
     # Note: LiveExecutionClient methods usually take commands (OrderSubmit, OrderCancel) 
@@ -140,7 +148,7 @@ class BitbankExecutionClient(LiveExecutionClient):
                 instrument_id=command.instrument_id,
                 client_order_id=command.client_order_id,
                 venue_order_id=venue_order_id,
-                account_id=self.config.account_id, # Optional?
+                account_id=self.account_id, # Optional?
                 event_id=self._clock.timestamp_ns(), # using unique ID ideally
                 ts_event=self._clock.timestamp_ns(),
                 ts_init=self._clock.timestamp_ns(),
@@ -175,7 +183,7 @@ class BitbankExecutionClient(LiveExecutionClient):
                 instrument_id=command.instrument_id,
                 client_order_id=command.client_order_id,
                 venue_order_id=venue_order_id,
-                account_id=self.config.account_id,
+                account_id=self.account_id,
                 event_id=self._clock.timestamp_ns(),
                 ts_event=self._clock.timestamp_ns(),
                 ts_init=self._clock.timestamp_ns(),
@@ -191,7 +199,7 @@ class BitbankExecutionClient(LiveExecutionClient):
         report = OrderRejected(
             instrument_id=command.instrument_id,
             client_order_id=command.client_order_id,
-            account_id=self.config.account_id,
+            account_id=self.account_id,
             reason=reason,
             event_id=self._clock.timestamp_ns(),
             ts_event=self._clock.timestamp_ns(),
@@ -204,7 +212,7 @@ class BitbankExecutionClient(LiveExecutionClient):
             instrument_id=command.instrument_id,
             client_order_id=command.client_order_id,
             venue_order_id=command.venue_order_id,
-            account_id=self.config.account_id,
+            account_id=self.account_id,
             reason=reason,
             event_id=self._clock.timestamp_ns(),
             ts_event=self._clock.timestamp_ns(),
