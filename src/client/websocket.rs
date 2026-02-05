@@ -10,6 +10,7 @@ use url::Url;
 pub struct BitbankWebSocketClient {
     sender: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
     callback: Arc<std::sync::Mutex<Option<PyObject>>>,
+    disconnect_callback: Arc<std::sync::Mutex<Option<PyObject>>>,
 }
 
 #[pymethods]
@@ -19,6 +20,7 @@ impl BitbankWebSocketClient {
         Self { 
             sender: Arc::new(Mutex::new(None)),
             callback: Arc::new(std::sync::Mutex::new(None)),
+            disconnect_callback: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -27,9 +29,15 @@ impl BitbankWebSocketClient {
         *lock = Some(callback);
     }
 
+    pub fn set_disconnect_callback(&self, callback: PyObject) {
+        let mut lock = self.disconnect_callback.lock().unwrap();
+        *lock = Some(callback);
+    }
+
     pub fn connect_py(&self, py: Python) -> PyResult<PyObject> {
         let sender_arc = self.sender.clone();
         let callback_arc = self.callback.clone();
+        let disconnect_callback_arc = self.disconnect_callback.clone();
         
         let future = async move {
             let url = Url::parse("wss://stream.bitbank.cc/socket.io/?EIO=4&transport=websocket")
@@ -63,7 +71,6 @@ impl BitbankWebSocketClient {
                                         let _ = write.send(Message::Text("3".to_string())).await;
                                     } else if txt.starts_with("42") {
                                         // Invoke callback
-                                        // Access std::sync::Mutex regardless of async ctx (it blocks, but fast)
                                         let cb_opt = {
                                             let lock = callback_arc.lock().unwrap();
                                             lock.clone()
@@ -71,17 +78,12 @@ impl BitbankWebSocketClient {
 
                                         if let Some(cb) = cb_opt {
                                             let txt_clone = txt.clone();
-                                            // Call Python callback
                                             Python::with_gil(|py| {
                                                 if let Err(e) = cb.call1(py, (txt_clone,)) {
                                                     e.print(py);
                                                 }
                                             });
-                                        } else {
-                                            println!("Received (no callback): {}", txt);
                                         }
-                                    } else {
-                                        // println!("Received raw: {}", txt);
                                     }
                                 }
                                 Some(Ok(Message::Close(_))) => break,
@@ -107,6 +109,20 @@ impl BitbankWebSocketClient {
                     }
                 }
                 println!("WebSocket loop terminated");
+                
+                // Call disconnect callback if set
+                let disconnect_cb_opt = {
+                    let lock = disconnect_callback_arc.lock().unwrap();
+                    lock.clone()
+                };
+
+                if let Some(cb) = disconnect_cb_opt {
+                    Python::with_gil(|py| {
+                        if let Err(e) = cb.call0(py) {
+                            e.print(py);
+                        }
+                    });
+                }
             });
 
             Ok("Connected")

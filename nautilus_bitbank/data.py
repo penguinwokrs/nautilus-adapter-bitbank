@@ -41,26 +41,54 @@ class BitbankDataClient(LiveDataClient):
         # WebSocket Client
         self._ws_client = bitbank.BitbankWebSocketClient()
         self._ws_client.set_callback(self._handle_message)
+        self._ws_client.set_disconnect_callback(self._on_ws_disconnect)
         
         self._connected = False
+        self._reconnect_lock = asyncio.Lock()
         # Map instrument_id (str) -> Instrument
         self._subscribed_instruments: Dict[str, Instrument] = {}
 
     async def _connect(self):
-        self._logger.info("Connecting to Bitbank WebSocket...")
-        try:
-            await self._ws_client.connect_py()
-            self._connected = True
-            self._logger.info("Connected to Bitbank WebSocket")
-            
-            # Re-subscribe and handle existing subscriptions if any
-            if self._subscribed_instruments:
-                await self.subscribe(list(self._subscribed_instruments.values()))
+        """Connect to Bitbank WebSocket with exponential backoff."""
+        attempt = 0
+        delay = 1.0
+        max_delay = 60.0
+        
+        while True:
+            self._logger.info(f"Connecting to Bitbank WebSocket (attempt {attempt + 1})...")
+            try:
+                await self._ws_client.connect_py()
+                self._connected = True
+                self._logger.info("Connected to Bitbank WebSocket")
                 
-        except Exception as e:
-            self._logger.error(f"Failed to connect: {e}")
-            # Do not raise here, allow connection handler to retry
-            self._connected = False
+                # Re-subscribe and handle existing subscriptions if any
+                if self._subscribed_instruments:
+                    await self.subscribe(list(self._subscribed_instruments.values()))
+                break
+            except Exception as e:
+                attempt += 1
+                self._logger.error(f"Failed to connect: {e}")
+                self._connected = False
+                
+                self._logger.info(f"Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
+
+    async def _reconnect_safe(self):
+        """Safely attempt to reconnect if not already connected."""
+        async with self._reconnect_lock:
+            if not self._connected:
+                await self._connect()
+
+    def _on_ws_disconnect(self):
+        """Callback triggered when WebSocket connection is lost."""
+        self._logger.warning("Bitbank WebSocket disconnected!")
+        self._connected = False
+        # Schedule reconnection on the main event loop
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.run_coroutine_threadsafe(self._reconnect_safe(), self.loop)
+            )
 
     async def _disconnect(self):
         self._connected = False
