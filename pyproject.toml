@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nautilus-adapter-bitbank"
+version = "0.1.0"
+description = "Bitbank adapter for NautilusTrader"
+requires-python = ">=3.11"
+dependencies = [
+    "nautilus-trader>=1.204.0",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "nautilus_bitbank._nautilus_bitbank"

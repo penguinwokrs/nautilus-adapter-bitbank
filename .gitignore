@@ -1,0 +1,16 @@
+#rust
+target/
+
+#maturin
+.maturin/
+
+#other
+.DS_Store
+
+#python
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.local
+.env.*.local
