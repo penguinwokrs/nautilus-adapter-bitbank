@@ -13,6 +13,7 @@ class BitbankDataClientConfig(LiveDataClientConfig):
 class BitbankExecClientConfig(LiveExecClientConfig):
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
+    use_pubnub: bool = True  # Enable/Disable real-time PubNub updates
     
     def __post_init__(self):
         super().__post_init__()

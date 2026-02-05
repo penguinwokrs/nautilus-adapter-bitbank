@@ -81,6 +81,11 @@ class BitbankExecutionClient(LiveExecutionClient):
 
     async def _connect(self):
         self._logger.info("BitbankExecutionClient connected")
+        
+        if not self.config.use_pubnub:
+            self._logger.info("PubNub integration disabled by config.")
+            return
+
         try:
             # 1. Get PubNub Auth
             auth_json = await self._client.get_pubnub_auth_py()
