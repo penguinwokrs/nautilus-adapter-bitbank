@@ -9,5 +9,6 @@ mod model;
 fn _nautilus_bitbank(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<client::rest::BitbankRestClient>()?;
     m.add_class::<client::websocket::BitbankWebSocketClient>()?;
+    m.add_class::<client::pubnub::PubNubClient>()?;
     Ok(())
 }

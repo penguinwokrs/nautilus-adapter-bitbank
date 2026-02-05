@@ -1,5 +1,6 @@
 pub mod market_data;
 pub mod order;
+pub mod pubnub;
 
 use serde::Deserialize;
 

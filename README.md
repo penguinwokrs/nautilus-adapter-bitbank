@@ -19,6 +19,7 @@ A high-performance [Nautilus Trader](https://nautilustrader.io/) adapter for the
   - Accurate executions (partial/full fills).
   - Exact fees (commissions) in quote currency.
   - Maker/Taker liquidity classification.
+  - **PubNub Support (Experimental)**: Connects to Bitbank's private PubNub stream for low-latency updates.
 - **Robustness**: Handles Bitbank-specific error codes (e.g., insufficient funds, minimum quantity errors) and maps them to human-readable messages.
 
 ## Installation

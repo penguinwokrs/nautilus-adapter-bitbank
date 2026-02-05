@@ -62,6 +62,18 @@ class BitbankExecutionClient(LiveExecutionClient):
             self.config.api_key,
             self.config.api_secret
         )
+        
+        self._pubnub_client = bitbank.PubNubClient()
+        self._pubnub_client.set_callback(self._handle_pubnub_message)
+        self._pubnub_task = None
+        
+        # Track order states for event generation from stream/poll
+        # Map: venue_order_id (str) -> { "last_executed_qty": Decimal, "reported_trades": Set[str] }
+        self._order_states: Dict[str, dict] = {}
+        
+        # Map: venue_order_id (str) -> Order
+        # Required to map stream updates back to Nautilus context
+        self._active_orders: Dict[str, Order] = {}
 
     @property
     def account_id(self) -> AccountId:
@@ -69,9 +81,37 @@ class BitbankExecutionClient(LiveExecutionClient):
 
     async def _connect(self):
         self._logger.info("BitbankExecutionClient connected")
+        try:
+            # 1. Get PubNub Auth
+            auth_json = await self._client.get_pubnub_auth_py()
+            auth_data = json.loads(auth_json)
+            # Expected: {"success":1, "data":{"subscribe_key":"...", "channel":"..."}}
+            
+            if auth_data.get("success") == 1:
+                data = auth_data.get("data", {})
+                sub_key = data.get("subscribe_key")
+                channel = data.get("channel")
+                
+                if sub_key and channel:
+                    self._logger.info(f"Starting PubNub stream on channel: {channel}")
+                    # 2. Connect PubNub (starts background loop in Rust)
+                    await self._pubnub_client.connect_py(sub_key, channel)
+                else:
+                    self._logger.error("PubNub auth data missing key or channel")
+            else:
+                 self._logger.error(f"Failed to get PubNub auth: {auth_json}")
+
+        except Exception as e:
+            self._logger.error(f"Failed to connect PubNub: {e}")
+            # Non-critical failure, fallback to polling
+            pass
 
     async def _disconnect(self):
         self._is_stopped = True
+        try:
+            await self._pubnub_client.stop_py()
+        except:
+            pass
         self._logger.info("BitbankExecutionClient disconnected")
     
     async def generate_order_status_reports(self, instrument_id=None, client_order_id=None):
@@ -94,7 +134,19 @@ class BitbankExecutionClient(LiveExecutionClient):
     # In recent Nautilus, `set_execution_client` triggers commands.
     # The commands are processed.
     # The base class defines: `submit_order(self, command: OrderSubmit)`
-    # Let's assume OrderSubmit command.
+    def _handle_pubnub_message(self, msg: str):
+        """Handle incoming PubNub message."""
+        try:
+            # Parse message
+            # Structure usually: {"data": { "order_id": ..., "status": ... }}
+            data = json.loads(msg)
+            # Only log for now until we implement event generation
+            # self._logger.info(f"PubNub Message: {data}")
+            
+            # TODO: Parse order update and call generate_order_filled / generate_order_status
+            pass
+        except Exception as e:
+            self._logger.error(f"Error handling PubNub message: {e}")
 
     def submit_order(self, command: SubmitOrder) -> None:
         self.create_task(self._submit_order(command))
@@ -140,6 +192,9 @@ class BitbankExecutionClient(LiveExecutionClient):
             
             venue_order_id = VenueOrderId(str(resp.get("order_id")))
             
+            # Register active order for PubNub updates
+            self._active_orders[str(venue_order_id)] = order
+            
             # Use the proper API to generate OrderAccepted event
             self.generate_order_accepted(
                 strategy_id=order.strategy_id,
@@ -150,7 +205,7 @@ class BitbankExecutionClient(LiveExecutionClient):
             )
             self._logger.info(f"Order accepted: {venue_order_id}")
 
-            # Start polling for this order
+            # Start polling for this order (fallback & detail retrieval)
             self.create_task(self._poll_order(order, venue_order_id))
 
 

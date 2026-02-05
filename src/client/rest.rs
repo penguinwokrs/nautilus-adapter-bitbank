@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
 use crate::error::BitbankError;
-use crate::model::{BitbankResponse, BitbankErrorResponse, market_data::{Ticker, Depth, PairsContainer}, order::{Order, Trades}};
+use crate::model::{BitbankResponse, BitbankErrorResponse, market_data::{Ticker, Depth, PairsContainer}, order::{Order, Trades}, pubnub::PubNubConnectParams};
 use std::time::{SystemTime, UNIX_EPOCH};
 use pyo3::prelude::*;
 
@@ -123,6 +123,20 @@ impl BitbankRestClient {
                 
             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
             Ok(json)
+        };
+        pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
+    }
+
+    pub fn get_pubnub_auth_py(&self, py: Python) -> PyResult<PyObject> {
+        let client = self.clone();
+        let future = async move {
+             let endpoint = "/v1/user/subscribe";
+             let res: PubNubConnectParams = client.request(Method::GET, endpoint, None, None, true)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+             Ok(json)
         };
         pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
     }
