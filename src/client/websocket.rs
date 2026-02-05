@@ -129,4 +129,22 @@ impl BitbankWebSocketClient {
         
         pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
     }
+
+    pub fn disconnect_py(&self, py: Python) -> PyResult<PyObject> {
+        let sender_arc = self.sender.clone();
+        let callback_arc = self.callback.clone();
+        
+        let future = async move {
+            {
+                let mut lock = sender_arc.lock().await;
+                *lock = None; // This will drop tx and close rx, terminating the loop
+            }
+            {
+                let mut lock = callback_arc.lock().unwrap();
+                *lock = None; // Clear callback to avoid GIL issues
+            }
+            Ok("Disconnected")
+        };
+        pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
+    }
 }

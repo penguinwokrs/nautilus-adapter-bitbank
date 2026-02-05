@@ -64,6 +64,10 @@ class BitbankDataClient(LiveDataClient):
 
     async def _disconnect(self):
         self._connected = False
+        try:
+            await self._ws_client.disconnect_py()
+        except:
+            pass
         self._logger.info("Disconnected")
 
     async def subscribe(self, instruments: List[Instrument]):
@@ -174,13 +178,14 @@ class BitbankDataClient(LiveDataClient):
             ts_event = int(tx.get("executed_at", 0)) * 1_000_000
             
             if price and amount:
-                side = AggressorSide.BUY if side_str == "buy" else AggressorSide.SELL
+                side = AggressorSide.BUYER if side_str == "buy" else AggressorSide.SELLER
                 
                 tick = TradeTick(
                     instrument_id=instrument.id,
                     price=Price.from_str(price),
                     size=Quantity.from_str(amount),
-                    side=side,
+                    aggressor_side=side,
+                    trade_id=TradeId(str(tx.get("transaction_id"))),
                     ts_event=ts_event,
                     ts_init=self._clock.timestamp_ns(),
                 )
