@@ -15,9 +15,12 @@ from nautilus_bitbank.config import BitbankDataClientConfig, BitbankExecClientCo
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("LiveSmokeTest")
 
-# Credentials from user provided info
-API_KEY = "REDACTED_API_KEY"
-API_SECRET = "REDACTED_API_SECRET"
+# Load credentials from environment variables
+API_KEY = os.environ.get("BITBANK_API_KEY", "")
+API_SECRET = os.environ.get("BITBANK_API_SECRET", "")
+
+if not API_KEY or not API_SECRET:
+    raise EnvironmentError("BITBANK_API_KEY and BITBANK_API_SECRET environment variables must be set")
 
 async def main():
     logger.info("Starting Live Smoke Test...")
