@@ -7,7 +7,9 @@ from decimal import Decimal
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.orders import Order
-from nautilus_trader.model.objects import Money, Currency
+from nautilus_trader.model.objects import Money, Currency, AccountBalance
+from nautilus_trader.model.events import AccountState
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import JPY
 from nautilus_trader.model.identifiers import Venue, ClientId, AccountId, VenueOrderId
 from nautilus_trader.model.enums import OrderSide, OrderType, OmsType, AccountType
@@ -60,13 +62,24 @@ class BitbankExecutionClient(LiveExecutionClient):
         return self._account_id
 
     async def _connect(self):
-        self._logger.info("BitbankExecutionClient connected (via Rust)")
+        self._logger.info("BitbankExecutionClient connecting...")
         
         if self.config.use_pubnub:
             try:
                 # Delegate Auth and Connect to Rust
                 await self._rust_client.connect()
                 self._logger.info("PubNub stream started via Rust client")
+                
+                # Initial Account State Fetch
+                try:
+                    reports = await self.generate_account_status_reports()
+                    if reports:
+                        for report in reports:
+                            self._send_account_state(report)
+                        self._logger.info(f"Published {len(reports)} account reports")
+                except Exception as e:
+                    self._logger.error(f"Failed to fetch initial account state: {e}")
+
             except Exception as e:
                 self._logger.error(f"Failed to connect PubNub via Rust: {e}")
 
@@ -284,11 +297,78 @@ class BitbankExecutionClient(LiveExecutionClient):
     async def generate_order_status_reports(self, instrument_id=None, client_order_id=None):
         return []
 
+    async def generate_account_status_reports(self, instrument_id=None, client_order_id=None):
+        """
+        Fetch assets from Bitbank and report AccountState.
+        """
+        try:
+            reports = []
+            
+            # 1. Fetch assets via Rust
+            assets_json = await self._rust_client.get_assets_py()
+            print(f"!!! DEBUG_ASSETS !!!: {assets_json}")
+            
+            assets_data = json.loads(assets_json).get("assets", [])
+            
+            nautilus_balances = []
+            for asset in assets_data:
+                currency_str = asset["asset"].upper()
+                try:
+                    currency = Currency.from_str(currency_str)
+                    
+                    total = Decimal(asset["onhand_amount"])
+                    locked = Decimal(asset["locked_amount"])
+                    free = total - locked
+                    
+                    nautilus_balances.append(
+                        AccountBalance(
+                            total=Money(total, currency),
+                            locked=Money(locked, currency),
+                            free=Money(free, currency),
+                        )
+                    )
+                    print(f"!!! DEBUG_BALANCE !!!: {currency} Total={total} Locked={locked}")
+                except Exception as e:
+                    print(f"!!! DEBUG_PARSE_ERROR !!!: {currency_str} {e}")
+                    continue
+            
+            # Create AccountState
+            # If nautilus_balances is empty, we must provide at least one balance (AccountState requires it)
+            if not nautilus_balances:
+                print("!!! DEBUG: No balances found, adding zero JPY balance")
+                nautilus_balances.append(
+                    AccountBalance(
+                        total=Money(0, JPY),
+                        locked=Money(0, JPY),
+                        free=Money(0, JPY),
+                    )
+                )
+
+            account_state = AccountState(
+                account_id=self._account_id,
+                account_type=self.account_type,
+                base_currency=None, # Multi-currency
+                reported=True,
+                balances=nautilus_balances,
+                margins=[], 
+                info={},
+                event_id=UUID4(),
+                ts_event=self._clock.timestamp_ns(),
+                ts_init=self._clock.timestamp_ns(),
+            )
+            reports.append(account_state)
+            
+            return reports
+            
+        except Exception as e:
+            print(f"!!! DEBUG: Failed to generate account status reports: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
     async def generate_fill_reports(self, instrument_id=None, client_order_id=None):
         return []
 
-    async def generate_position_reports(self, instrument_id=None):
-        return []
 
     async def generate_position_status_reports(self, instrument_id=None):
         return []

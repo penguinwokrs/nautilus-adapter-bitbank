@@ -6,6 +6,7 @@ class BitbankDataClientConfig(LiveDataClientConfig):
     api_secret: Optional[str] = None
     timeout_ms: int = 10000
     proxy_url: Optional[str] = None
+    use_pubnub: bool = True  # Enable/Disable real-time PubNub updates (default: True)
     order_book_depth: int = 20  # How many levels to pass from Rust to Python (Top N)
 
     def __post_init__(self):

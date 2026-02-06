@@ -51,10 +51,18 @@ class BitbankDataClient(LiveMarketDataClient):
         )
 
     async def _connect(self):
-        # Delegate connection to Rust
-        # Rust connects async and runs its own loop
-        await self._rust_client.connect()
-        self._logger.info("Connected to Bitbank via Rust client")
+        self._logger.info("BitbankDataClient connected")
+        
+        # Load instruments first
+        await self._load_instruments()
+
+        if self.config.use_pubnub:
+            # Delegate connection to Rust (PubNub)
+            await self._rust_client.connect()
+            self._logger.info("Connected to Bitbank via Rust client (PubNub)")
+        else:
+            self._logger.info("PubNub disabled. Using REST polling (not implemented yet)")
+            # TODO: Implement REST polling loop here if needed
 
     async def _disconnect(self):
         await self._rust_client.disconnect()
@@ -288,5 +296,113 @@ class BitbankDataClient(LiveMarketDataClient):
 
     async def _unsubscribe_order_book_snapshots(self, instrument_id):
         pass
+
+    async def _load_instruments(self):
+        if not self.config.instrument_provider or not self.config.instrument_provider.load_ids:
+            return
+        
+        load_ids = list(self.config.instrument_provider.load_ids)
+
+        try:
+            import aiohttp
+            from nautilus_trader.model.instruments import CurrencyPair
+            from nautilus_trader.model.identifiers import Symbol, Venue, InstrumentId
+            from nautilus_trader.model.objects import Price, Quantity
+            from nautilus_trader.model.currencies import Currency
+            from decimal import Decimal
+        except ImportError as e:
+            self._logger.error(f"Imports failed: {e}")
+            return
+            
+        # Helper to add instrument manually
+        def add_manual_instrument(symbol_str: str, base: str, quote: str, p_prec: int, q_prec: int, min_q: str):
+             try:
+                instrument_id = InstrumentId.from_str(f"{symbol_str}.BITBANK")
+                
+                # Check if already exists in provider but allow updating cache if needed
+                exists_in_provider = False
+                try: 
+                    if self._instrument_provider.find(instrument_id):
+                        exists_in_provider = True
+                except:
+                    pass
+
+                price_inc = Decimal("1").scaleb(-p_prec)
+                qty_inc = Decimal("1").scaleb(-q_prec)
+                
+                # Use CurrencyPair for spot instruments
+                instrument = CurrencyPair(
+                    instrument_id=instrument_id,
+                    raw_symbol=Symbol(symbol_str),
+                    base_currency=Currency.from_str(base),
+                    quote_currency=Currency.from_str(quote),
+                    price_precision=p_prec,
+                    size_precision=q_prec,
+                    price_increment=Price(price_inc, p_prec),
+                    size_increment=Quantity(qty_inc, q_prec),
+                    ts_event=0,
+                    ts_init=0,
+                    min_quantity=Quantity(Decimal(min_q), q_prec),
+                    lot_size=None,
+                )
+                
+                if not exists_in_provider:
+                    self._instrument_provider.add(instrument)
+                    self._logger.info(f"Loaded fallback instrument {instrument_id} to provider")
+                
+                # Also add to Cache to ensure RiskEngine and Strategy see it
+                if self._cache:
+                    self._cache.add_instrument(instrument)
+             except Exception as e:
+                self._logger.error(f"Failed to add manual instrument {symbol_str}: {e}")
+
+        # Try fetching from API
+        url = "https://public.bitbank.cc/bitbankcc/pairs"
+        data = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                    else:
+                        self._logger.warning(f"Failed to fetch pairs API: {response.status}. Using manual fallback.")
+        except Exception as e:
+            self._logger.warning(f"Error fetching pairs API: {e}. Using manual fallback.")
+
+        # Process API data if available
+        if data:
+            pairs_data = data.get("data", {}).get("pairs", [])
+            pairs_map = {p["name"]: p for p in pairs_data}
+
+            for instrument_id_str in self.config.instrument_provider.load_ids:
+                try:
+                    # Handle both 'BTC/JPY.BITBANK' and 'BTC/JPY' formats
+                    if "." in instrument_id_str:
+                         native_symbol = instrument_id_str.split(".")[0]
+                    else:
+                         native_symbol = instrument_id_str
+                    
+                    pair_name = native_symbol.replace("/", "_").lower()
+                    info = pairs_map.get(pair_name)
+                    
+                    if info:
+                        base = info["base_asset"].upper()
+                        quote = info["quote_asset"].upper()
+                        p_prec = int(info["price_digits"])
+                        q_prec = int(info["amount_digits"])
+                        min_q = info["unit_amount"]
+                        add_manual_instrument(native_symbol, base, quote, p_prec, q_prec, min_q)
+                    else:
+                        # Fallback if specific pair not in API result
+                        self._logger.info(f"Pair {pair_name} not in API data, trying fallback")
+                        if "BTC/JPY" in instrument_id_str:
+                             add_manual_instrument("BTC/JPY", "BTC", "JPY", 0, 4, "0.0001")
+                except Exception as e:
+                    self._logger.error(f"Error processing instrument {instrument_id_str}: {e}")
+        else:
+            # Full Fallback (API failed)
+            for instrument_id_str in self.config.instrument_provider.load_ids:
+                if "BTC/JPY" in instrument_id_str:
+                     add_manual_instrument("BTC/JPY", "BTC", "JPY", 0, 4, "0.0001")
 
 

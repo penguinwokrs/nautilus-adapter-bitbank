@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
 use crate::error::BitbankError;
-use crate::model::{BitbankErrorResponse, market_data::{Ticker, Depth, PairsContainer}, order::{Order, Trades}, pubnub::PubNubConnectParams};
+use crate::model::{BitbankErrorResponse, market_data::{Ticker, Depth, PairsContainer}, order::{Order, Trades}, pubnub::PubNubConnectParams, assets::Assets};
 use std::time::{SystemTime, UNIX_EPOCH};
 use pyo3::prelude::*;
 
@@ -147,6 +147,18 @@ impl BitbankRestClient {
         };
         pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
     }
+
+    pub fn get_assets_py(&self, py: Python) -> PyResult<PyObject> {
+        let client = self.clone();
+        let future = async move {
+             let res = client.get_assets().await
+                .map_err(PyErr::from)?;
+
+             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+             Ok(json)
+        };
+        pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
+    }
 }
 
 // Internal pure Rust implementations
@@ -160,6 +172,12 @@ impl BitbankRestClient {
         let endpoint = "/v1/spot/pairs";
         self.request(Method::GET, endpoint, None, None, true).await
     }    
+
+    pub async fn get_assets(&self) -> Result<Assets, BitbankError> {
+        let endpoint = "/v1/user/assets";
+        self.request(Method::GET, endpoint, None, None, true).await
+    }
+
     fn generate_signature(&self, text: &str) -> String {
         let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
             .expect("HMAC can take key of any size");

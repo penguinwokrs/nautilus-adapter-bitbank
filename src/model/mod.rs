@@ -2,6 +2,7 @@ pub mod market_data;
 pub mod order;
 pub mod pubnub;
 pub mod orderbook;
+pub mod assets;
 
 use serde::Deserialize;
 

@@ -47,6 +47,10 @@ impl BitbankExecutionClient {
         self.rest_client.get_trade_history_py(py, pair, order_id)
     }
 
+    pub fn get_assets_py(&self, py: Python) -> PyResult<PyObject> {
+        self.rest_client.get_assets_py(py)
+    }
+
     pub fn submit_order(&self, py: Python, pair: String, amount: String, side: String, order_type: String, client_order_id: String, price: Option<String>) -> PyResult<PyObject> {
         let rest_client = self.rest_client.clone();
         let orders_arc = self.orders.clone();
