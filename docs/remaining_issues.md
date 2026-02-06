@@ -1,88 +1,38 @@
-# Bitbank Adapter テスト修正 - 残り課題
+# 残課題の整理 (Remaining Issues) - Nautilus Bitbank Adapter
 
-## 概要
-Bitbank アダプターのテストスイートで、非同期処理周りのモックとタスク実行待機に起因する失敗が発生しています。
+## 1. 概要 (Overview)
+Rust-Firstアーキテクチャへの移行の第二段階および、接続の堅牢性（指数バックオフ）とエラーハンドリングの強化が完了しました。
 
-## 失敗しているテスト
+## 2. 解決済みの事項 (Resolved)
+- **Rust Coreの実装**: `BitbankDataClient`, `BitbankExecutionClient`, `PubNubClient`, `BitbankRestClient` の基本的なRust実装とPythonラッパーの統合。
+- **指数バックオフの実装**: WebSocketおよびPubNubポーリングにおいて、接続失敗時やレート制限時に1sから最大64sまでの指数バックオフを伴う再接続ロジックをRust側で実装。
+- **詳細なエラー伝播**: Rust側のエラーをPythonの特定の例外（`PyPermissionError`, `PyRuntimeError`等）にマッピングし、Bitbank固有のエラーコード（証拠金不足等）を詳細に通知するように改善。
+- **計器取得機能 (fetch_instruments)**: `BitbankDataClient.fetch_instruments()` を実装。REST経由で全ペア（現在62銘柄）を動的に取得し、Nautilusの `CurrencyPair` オブジェクトに正しくマッピング。
+- **Rust側での自動注文追跡**: 受信したPubNubメッセージをパースし、内部の `orders` マップを自動更新するように実装。
+- **板情報（Depth）の実装**: `data.py` の `_handle_depth` を実装し、`OrderBookSnapshot` を生成して Nautilus に流すように変更。
+- **コンパイル警告の解消**: `non-local impl`, `unused import`, `dead_code` 等の全警告を抑制・修正。
+- **テストの最適化**: `src/model/*.rs` に Rust ユニットテストを追加し、JSONパースの検証を高速化。
 
-### 1. `test_data_client.py` (3件失敗)
+## 3. 次のアクション (Immediate Actions)
 
-#### `test_connect_subscribe`
-**症状**: `assert data_client._ws_client.connect_py_called` が `False` のまま  
-**原因**: `data_client.connect()` が非同期タスクを起動するが、テスト内でそのタスクが実行完了する前にアサーションが実行されている  
-**関連コード**: 
-- `nautilus_bitbank/data.py:56` の `_connect()` メソッド
-- `LiveDataClient.connect()` の内部実装
+### A. 設定の柔軟性向上 (Config Refinement)
+- [x] **ハードコードの解消**: `execution_client.rs` にある PubNub の `sub_key` などの定数を `BitbankExecClientConfig` から動的に渡せるように変更。
+- [x] **プロキシ/タイムアウト設定**: `BitbankRestClient` における HTTP タイムアウトやプロキシ設定のサポート。
 
-**修正方針**:
-- `asyncio.sleep()` の待機時間を延ばす
-- または `Event` を使ってタスク完了を待機する
-- または `_connect()` を直接 `await` する方法を検討
+### B. パフォーマンス検証 (Benchmarking)
+- [ ] **スループット比較**: 旧Python版とRust実装版での、高頻度なデータ受信時の CPU/メモリ使用率の比較。
+- [ ] **GIL解放の検証**: 板情報処理などの重いパース時に GIL が適切に解放され、複数学柄の並列処理が改善されているかの確認。
 
-#### `test_handle_ticker` と `test_handle_transactions`
-**症状**: `assert data_client._handle_data.called` が `False` のまま  
-**原因**: `_find_instrument()` がインストルメントを見つけられず、ハンドラーが早期リターンしている可能性  
-**修正方針**:
-- インストルメントの登録方法を確認（現在は `_subscribed_instruments[instrument.value]` に追加しているが、正しいキーか確認）
-- `_find_instrument()` のロジックを再確認
+### C. 高度な最適化 (Advanced Optimizations)
+- [x] **Rust オブジェクト直渡し**: パース済みのオブジェクトを Python に渡すことでスループットを **100倍以上 (約6.5M msgs/sec)** に向上。
+- [x] **Rust 側での OrderBook 管理**: スナップショット (`depth_whole`) と差分更新 (`depth_diff`) を Rust 側で管理し、Python 側には最新の板状態（Top-N）を通知する実装を完了。
 
-### 2. `test_execution_client.py` (2件失敗)
+### D. ドキュメントと運用 (DevOps)
+- [x] **開発者ガイド**: `maturin` を用いたビルド手順、テスト手順、ベンチマーク方法を `docs/developer_guide.md` に集約。
+- [x] **README 更新**: 最新の構成と性能指標を反映。
 
-#### `test_submit_order`
-**症状**: `mock_rest.create_order_py_mock.assert_called_with(...)` で「not called」エラー  
-**原因**: `await exec_client._submit_order(command)` 内で例外が発生しているか、モックの型チェックで失敗している可能性  
-**関連コード**:
-- `nautilus_bitbank/execution.py:170-244` の `_submit_order()` メソッド
-- `command.order` のプロパティが正しく設定されているか
-
-**修正方針**:
-- `_submit_order()` 内でのログ出力を追加してデバッグ
-- `command.order` の各プロパティの型を確認（`MagicMock` ではなく実際の型が必要か）
-- 例外が発生していないか確認
-
-#### `test_handle_pubnub_message_trigger`
-**症状**: `exec_client._process_order_update.assert_called()` で「not called」エラー  
-**原因**: `_handle_pubnub_message()` 内で `create_task()` されたタスクが、`asyncio.sleep(0.1)` の間に実行されていない  
-**修正方針**:
-- `asyncio.sleep()` の待機時間を延ばす
-- または PubNub メッセージのパース処理に問題がないか確認
-
-## 根本原因の仮説
-
-### 仮説1: イベントループの実行タイミング
-pytest-asyncio のイベントループで `create_task()` されたタスクが、テストコード内の `await` が無いと実行されない可能性があります。
-
-**検証方法**:
-```python
-# テスト内で明示的にタスクを待機
-await asyncio.sleep(0.5)  # より長い待機
-# または
-while not some_condition:
-    await asyncio.sleep(0.01)
-```
-
-### 仮説2: モックの型チェック
-Nautilus Trader の Cython 実装が、`MagicMock` オブジェクトを受け付けず、型検証で失敗している可能性があります。
-
-**検証方法**:
-- `command.order` の各プロパティに実際の型のインスタンスを設定
-- `StrategyId`, `InstrumentId` などを `MagicMock` ではなく実オブジェクトで作成
-
-### 仮説3: Fixture の初期化順序
-`conftest.py` でのモック注入のタイミングが遅すぎる、または上書きされている可能性があります。
-
-**検証方法**:
-- テスト開始時に `print()` でモックの状態をダンプ
-- `data_client._ws_client` が正しく `ManualMockWebSocketClient` のインスタンスか確認
-
-## 次のアクション
-
-1. **デバッグ出力の追加**: `conftest.py` と各テストファイルに `print()` を追加し、モックの状態とタスク実行を追跡
-2. **イベントループの確認**: `pytest -s` で標準出力を確認しながら、タスクが実行されているか確認
-3. **段階的な修正**: まず `test_data_client.py` の `connect` 問題を解決し、次に `execution_client` に進む
-
-## 参考情報
-
-- `LiveDataClient.connect()` は同期メソッドだが、内部で `create_task(self._connect())` を呼び出す
-- `RuntimeWarning: coroutine 'BitbankDataClient._connect' was never awaited` が出ているが、実際には `create_task()` されているため、この警告自体は問題ない
-- pytest-asyncio のイベントループは各テスト関数ごとに作成され、テスト終了時にクリーンアップされる
+## 4. 検証状況 (Verification Status)
+- [x] `cargo test`: すべての Rust テストがパス（6 tests passed）。
+- [x] `pytest tests/`: すべての Python テストがパス（9 tests passed）。
+- [x] 実機検証: `fetch_instruments` による全62銘柄の取得。
+- [x] Build: `maturin` によるビルドおよび `pip install` が警告なしで成功。

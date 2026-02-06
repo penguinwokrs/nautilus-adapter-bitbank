@@ -1,4 +1,5 @@
 use thiserror::Error;
+use pyo3::prelude::*;
 
 #[derive(Error, Debug)]
 pub enum BitbankError {
@@ -20,6 +21,28 @@ pub enum BitbankError {
         message: String,
     },
     
-    #[error("Unknown Error: {0}")]
+#[error("Unknown Error: {0}")]
     Unknown(String),
+}
+
+impl From<BitbankError> for PyResult<()> {
+    fn from(err: BitbankError) -> Self {
+        Err(PyErr::from(err))
+    }
+}
+
+impl From<BitbankError> for PyErr {
+    fn from(err: BitbankError) -> Self {
+        match err {
+            BitbankError::AuthError(e) => pyo3::exceptions::PyPermissionError::new_err(e),
+            BitbankError::ExchangeError { code, message } => {
+                match code {
+                    60001 => pyo3::exceptions::PyRuntimeError::new_err(format!("Insufficient Funds ({}): {}", code, message)),
+                    70001..=70014 => pyo3::exceptions::PyPermissionError::new_err(format!("Auth Error ({}): {}", code, message)),
+                    _ => pyo3::exceptions::PyRuntimeError::new_err(format!("Bitbank Error ({}): {}", code, message)),
+                }
+            }
+            _ => pyo3::exceptions::PyRuntimeError::new_err(err.to_string()),
+        }
+    }
 }

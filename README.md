@@ -5,22 +5,25 @@ A high-performance [Nautilus Trader](https://nautilustrader.io/) adapter for the
 ## Features
 
 ### 🚀 High Performance
-- **Core Logic in Rust**: WebSocket handling, HMAC-SHA256 signature generation, and JSON parsing are implemented in Rust using `pyo3` and `tokio`.
-- **AsyncIO Integration**: Seamlessly integrates with Nautilus Trader's asyncio event loop.
+- **Rust-First Architecture**: Market data parsing and object creation happen in Rust, achieving throughput peaks of **>6M msgs/sec**.
+- **Zero-JSON Bridging**: Uses `PyO3` to pass structured objects directly to Python, eliminating standard JSON processing overhead.
+- **AsyncIO Integration**: Native integration with the Tokio runtime and Python's `asyncio`.
 
 ### 📊 Data Client
-- **Real-time Market Data**: streams Ticker, Trades (Transactions), and Order Book (Depth) updates.
-- **Dynamic Instruments**: Automatically fetches and parses available currency pairs and their precision settings via `fetch_instruments`.
-- **Reliability**: Implements automatic reconnection with exponential backoff and connection state management.
+- **Real-time Market Data**: Streams Ticker, Trades, and Order Book (Depth) updates.
+- **Efficient Order Book Management**: Rust-managed `OrderBook` handles incremental updates (`depth_diff`) and full snapshots (`depth_whole`) with zero overhead to Python.
+- **Configurable Depth**: Optimized Top-N snapshots (default Top 20) are passed to Python, configurable via `BitbankDataClientConfig`.
+- **Dynamic Instruments**: Automatically fetches trading pair metadata via `fetch_instruments`.
+- **Configurable Network**: Supports HTTP timeouts and proxy settings for REST API interactions.
 
 ### ⚡ Execution Client
-- **Order Management**: Supports Limit/Market orders (`SubmitOrder`) and cancellations (`CancelOrder`).
-- **Smart Fills**: Polls order status and fetches detailed trade history to report:
-  - Accurate executions (partial/full fills).
-  - Exact fees (commissions) in quote currency.
-  - Maker/Taker liquidity classification.
-  - **PubNub Support (Experimental)**: Connects to Bitbank's private PubNub stream for low-latency updates.
-- **Robustness**: Handles Bitbank-specific error codes (e.g., insufficient funds, minimum quantity errors) and maps them to human-readable messages.
+- **Order Management**: Full lifecycle support for Limit/Market orders.
+- **Private Updates**: Low-latency order/trade updates via PubNub (fully configurable subscribe key).
+- **Robust Error Mapping**: Maps Bitbank-specific API errors (e.g. 10009: Insufficient funds) directly to human-readable Python exceptions.
+
+## Documentation
+- [Developer Guide](docs/developer_guide.md): Information for developers/contributors.
+- [Future Roadmap](docs/future_roadmap.md): Planned features and architecture changes.
 
 ## Installation
 

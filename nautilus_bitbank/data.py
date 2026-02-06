@@ -1,16 +1,11 @@
 import asyncio
 import json
 import logging
-from typing import Dict, List, Optional
-from datetime import datetime
+from typing import List
 
-from decimal import Decimal
 from nautilus_trader.live.data_client import LiveDataClient
 from nautilus_trader.model.instruments import Instrument
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue, ClientId, TradeId
-from nautilus_trader.model.data import QuoteTick, DataType
-from nautilus_trader.model.objects import Price, Quantity, Money
-from nautilus_trader.model.enums import LiquiditySide
+from nautilus_trader.model.identifiers import ClientId, Venue
 from .config import BitbankDataClientConfig
 
 try:
@@ -18,7 +13,12 @@ try:
 except ImportError:
     import _nautilus_bitbank as bitbank
 
+
 class BitbankDataClient(LiveDataClient):
+    """
+    Rust-First implementation wrapper.
+    Actual logic resides in bitbank.BitbankDataClient (Rust).
+    """
     def __init__(self, loop, config: BitbankDataClientConfig, msgbus, cache, clock):
         super().__init__(
             loop=loop, 
@@ -30,282 +30,207 @@ class BitbankDataClient(LiveDataClient):
             config=config
         )
         self.config = config
-        
-        # Validation for stability
-        if not self.config.api_key or not self.config.api_secret:
-            raise ValueError("BitbankDataClient requires both api_key and api_secret")
-            
         self._logger = logging.getLogger(__name__)
+        self._subscribed_instruments = {}  # format: "btc_jpy" -> Instrument
+
+        # Instantiate Rust Client
+        self._rust_client = bitbank.BitbankDataClient()
+        self._rust_client.set_data_callback(self._handle_rust_data)
         
-        # REST Client for snapshot/initial data if needed
         self._rest_client = bitbank.BitbankRestClient(
-            self.config.api_key,
-            self.config.api_secret
+            self.config.api_key or "",
+            self.config.api_secret or "",
+            self.config.timeout_ms,
+            self.config.proxy_url
         )
-        
-        # WebSocket Client
-        self._ws_client = bitbank.BitbankWebSocketClient()
-        self._ws_client.set_callback(self._handle_message)
-        self._ws_client.set_disconnect_callback(self._on_ws_disconnect)
-        
-        self._connected = False
-        self._reconnect_lock = asyncio.Lock()
-        # Map instrument_id (str) -> Instrument
-        self._subscribed_instruments: Dict[str, Instrument] = {}
 
     async def _connect(self):
-        """Connect to Bitbank WebSocket with exponential backoff."""
-        attempt = 0
-        delay = 1.0
-        max_delay = 60.0
-        
-        while True:
-            self._logger.info(f"Connecting to Bitbank WebSocket (attempt {attempt + 1})...")
-            try:
-                await self._ws_client.connect_py()
-                self._connected = True
-                self._logger.info("Connected to Bitbank WebSocket")
-                
-                # Re-subscribe and handle existing subscriptions if any
-                if self._subscribed_instruments:
-                    await self.subscribe(list(self._subscribed_instruments.values()))
-                break
-            except Exception as e:
-                attempt += 1
-                self._logger.error(f"Failed to connect: {e}")
-                self._connected = False
-                
-                self._logger.info(f"Retrying in {delay} seconds...")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, max_delay)
-
-    async def _reconnect_safe(self):
-        """Safely attempt to reconnect if not already connected."""
-        async with self._reconnect_lock:
-            if not self._connected:
-                await self._connect()
-
-    def _on_ws_disconnect(self):
-        """Callback triggered when WebSocket connection is lost."""
-        self._logger.warning("Bitbank WebSocket disconnected!")
-        self._connected = False
-        # Schedule reconnection on the main event loop
-        if self.loop.is_running():
-            self.loop.call_soon_threadsafe(
-                lambda: asyncio.run_coroutine_threadsafe(self._reconnect_safe(), self.loop)
-            )
+        # Delegate connection to Rust
+        # Rust connects async and runs its own loop
+        await self._rust_client.connect()
+        self._logger.info("Connected to Bitbank via Rust client")
 
     async def _disconnect(self):
-        self._connected = False
-        try:
-            await self._ws_client.disconnect_py()
-        except:
-            pass
-        self._logger.info("Disconnected")
+        await self._rust_client.disconnect()
 
     async def subscribe(self, instruments: List[Instrument]):
+        rooms = []
         for instrument in instruments:
-            self._subscribed_instruments[instrument.id.value] = instrument
-            
             symbol = instrument.id.symbol
             pair = symbol.value.replace("/", "_").lower()
+            self._subscribed_instruments[pair] = instrument
             
-            # Subscribe to Ticker
-            await self._ws_client.subscribe_py(f"ticker_{pair}")
-            
-            # Subscribe to Transactions (TradeTicks)
-            await self._ws_client.subscribe_py(f"transactions_{pair}")
-            
-            # Subscribe to Depth (OrderBook) - using depth_whole for simple full snapshot updates
-            await self._ws_client.subscribe_py(f"depth_whole_{pair}")
-            
-            self._logger.info(f"Subscribed to ticker, transactions and depth for {pair}")
+            rooms.extend([
+                f"ticker_{pair}",
+                f"transactions_{pair}",
+                f"depth_whole_{pair}",
+                f"depth_diff_{pair}"
+            ])
+        
+        if rooms:
+            await self._rust_client.subscribe(rooms)
 
     async def unsubscribe(self, instruments: List[Instrument]):
-        # Unsubscribe implementation would go here
         pass
 
-    def _handle_message(self, msg: str):
+    def _handle_rust_data(self, room_name: str, data):
+        """
+        Callback from Rust.
+        room_name: e.g. "ticker_btc_jpy"
+        data: PyObject (Ticker, Depth, or Transactions) from Rust
+        """
         try:
-            if not msg.startswith("42"):
-                return
-            
-            payload_str = msg[2:]
-            data_arr = json.loads(payload_str)
-            
-            if not isinstance(data_arr, list) or len(data_arr) < 2:
-                return
-                
-            event_type = data_arr[0]
-            if event_type != "message":
-                return
-                
-            content = data_arr[1]
-            room_name = content.get("room_name")
-            message_body = content.get("message", {})
-            data = message_body.get("data")
-            
-            if not data:
-                return
-
+            # Extract pair and type
             if room_name.startswith("ticker_"):
-                self._handle_ticker(room_name, data)
+                pair = room_name[len("ticker_"):]
+                self._handle_ticker(pair, data)
             elif room_name.startswith("transactions_"):
-                self._handle_transactions(room_name, data)
-            elif room_name.startswith("depth_whole_"):
-                self._handle_depth(room_name, data)
+                pair = room_name[len("transactions_"):]
+                self._handle_transactions(pair, data)
+            elif room_name.startswith("depth_whole_") or room_name.startswith("depth_diff_"):
+                if room_name.startswith("depth_whole_"):
+                    pair = room_name[len("depth_whole_"):]
+                else:
+                    pair = room_name[len("depth_diff_"):]
+                self._handle_depth(pair, data)
                 
         except Exception as e:
-            self._logger.error(f"Error handling message: {e} | Msg: {msg}")
+            self._logger.error(f"Error handling data from Rust: {e}")
 
-    def _handle_depth(self, room_name: str, data: dict):
-        pair = room_name.replace("depth_whole_", "")
-        instrument = self._find_instrument(pair)
-        
+    def _handle_ticker(self, pair: str, data: dict):
+        instrument = self._subscribed_instruments.get(pair)
         if not instrument:
             return
 
-        # from nautilus_trader.model.data import OrderBookUpdate
-        
-        # Bitbank depth_whole data: {"bids": [["price", "amount"], ...], "asks": [...], "timestamp": ...}
-        # bids_raw = data.get("bids", [])
-        # asks_raw = data.get("asks", [])
-        ts_event = int(data.get("timestamp", 0)) * 1_000_000
-        
-        self._logger.warning(f"Snapshot received for {pair} but OrderBookUpdate is not supported in this version.")
-        
-        # update = OrderBookUpdate(
-        #     instrument_id=instrument.id,
-        #     bids=bids,
-        #     asks=asks,
-        #     ts_event=ts_event,
-        #     ts_init=self._clock.timestamp_ns(),
-        # )
-        # self._handle_data(update)
+        from nautilus_trader.model.data import QuoteTick
+        from nautilus_trader.model.objects import Price, Quantity
 
-    def _handle_transactions(self, room_name: str, data: dict):
-        pair = room_name.replace("transactions_", "")
-        instrument = self._find_instrument(pair)
-        
+        # Ticker object has attributes: sell, buy, timestamp
+        bid = data.buy
+        ask = data.sell
+        ts = int(data.timestamp) * 1_000_000
+
+        if bid and ask:
+            quote = QuoteTick(
+                instrument_id=instrument.id,
+                bid_price=Price.from_str(str(bid)),
+                ask_price=Price.from_str(str(ask)),
+                bid_size=Quantity.from_str("0"), # bitbank ticker has no size
+                ask_size=Quantity.from_str("0"),
+                ts_event=ts,
+                ts_init=self._clock.timestamp_ns(),
+            )
+            self._handle_data(quote)
+
+    def _handle_transactions(self, pair: str, data: dict):
+        instrument = self._subscribed_instruments.get(pair)
         if not instrument:
             return
 
         from nautilus_trader.model.data import TradeTick
+        from nautilus_trader.model.objects import Price, Quantity
         from nautilus_trader.model.enums import AggressorSide
+        from nautilus_trader.model.identifiers import TradeId
 
-        transactions = data.get("transactions", [])
-        
-        for tx in transactions:
-            side_str = tx.get("side")
-            price = tx.get("price")
-            amount = tx.get("amount")
-            ts_event = int(tx.get("executed_at", 0)) * 1_000_000
+        # Transactions object has transactions list
+        txs = data.transactions
+        for tx in txs:
+            # tx: Transaction object attributes: transaction_id, price, amount, executed_at, side
+            price = tx.price
+            amount = tx.amount
+            side_str = tx.side
+            ts = int(tx.executed_at) * 1_000_000
             
-            if price and amount:
-                side = AggressorSide.BUYER if side_str == "buy" else AggressorSide.SELLER
-                
-                tick = TradeTick(
-                    instrument_id=instrument.id,
-                    price=Price.from_str(price),
-                    size=Quantity.from_str(amount),
-                    aggressor_side=side,
-                    trade_id=TradeId(str(tx.get("transaction_id"))),
-                    ts_event=ts_event,
-                    ts_init=self._clock.timestamp_ns(),
-                )
-                self._handle_data(tick)
-        
-    def _find_instrument(self, pair: str) -> Optional[Instrument]:
-        for inst in self._subscribed_instruments.values():
-            if inst.id.symbol.value.replace("/", "_").lower() == pair:
-                return inst
-        return None
+            aggressor_side = AggressorSide.BUYER if side_str == "buy" else AggressorSide.SELLER
 
-    def _handle_ticker(self, room_name: str, data: dict):
-        # Extract pair from room_name: ticker_btc_jpy
-        pair = room_name.replace("ticker_", "")
-        instrument = self._find_instrument(pair)
+            tick = TradeTick(
+                instrument_id=instrument.id,
+                price=Price.from_str(str(price)),
+                size=Quantity.from_str(str(amount)),
+                aggressor_side=aggressor_side,
+                trade_id=TradeId(str(tx.transaction_id)),
+                ts_event=ts,
+                ts_init=self._clock.timestamp_ns(),
+            )
+            self._handle_data(tick)
+
+    def _handle_depth(self, pair: str, data):
+        instrument = self._subscribed_instruments.get(pair)
+        if not instrument:
+            return
+
+        from nautilus_trader.model.data import OrderBookDelta, OrderBookDeltas, BookOrder
+        from nautilus_trader.model.enums import BookAction, OrderSide
+        from nautilus_trader.model.objects import Price, Quantity
         
-        if instrument:
-            # Parse data
-            # {"sell":"11339506","buy":"11337274","open":"...","high":"...","low":"...","last":"...","vol":"...","timestamp":1770258493976}
-            ask_price = data.get("sell")
-            bid_price = data.get("buy")
-            # timestamp is in ms, convert to ns
-            ts_event = int(data.get("timestamp", 0)) * 1_000_000
+        # OrderBook object from Rust
+        # Using configurable depth for optimal performance
+        top_asks, top_bids = data.get_top_n(self.config.order_book_depth)
+        ts = int(data.timestamp) * 1_000_000
+        ts_init = self._clock.timestamp_ns()
+
+        deltas = []
+        # Clear previous state to simulate a snapshot
+        deltas.append(OrderBookDelta.clear(instrument.id, 0, ts, ts_init))
+        
+        for p, q in top_asks:
+            order = BookOrder(OrderSide.SELL, Price.from_str(str(p)), Quantity.from_str(str(q)), 0)
+            deltas.append(OrderBookDelta(instrument.id, BookAction.ADD, order, 0, 0, ts, ts_init))
             
-            if ask_price and bid_price:
-                quote = QuoteTick(
-                    instrument_id=instrument.id,
-                    bid_price=Price.from_str(bid_price),
-                    ask_price=Price.from_str(ask_price),
-                    bid_size=Quantity.from_str("0"), # bitbank ticker doesn't provide size
-                    ask_size=Quantity.from_str("0"),
-                    ts_event=ts_event,
-                    ts_init=self._clock.timestamp_ns(),
-                )
-                # Use _handle_data to properly route through DataEngine to Cache
-                self._handle_data(quote)
-                self._logger.debug(f"Handled QuoteTick for {instrument.id}: {bid_price}/{ask_price}")
-            
-            self._logger.info(f"TICKER {instrument.id}: Last={data.get('last')} @ {ts_event}")
-            
+        for p, q in top_bids:
+            order = BookOrder(OrderSide.BUY, Price.from_str(str(p)), Quantity.from_str(str(q)), 0)
+            deltas.append(OrderBookDelta(instrument.id, BookAction.ADD, order, 0, 0, ts, ts_init))
+
+        snapshot = OrderBookDeltas(instrument.id, deltas)
+        self._handle_data(snapshot)
+
     async def fetch_instruments(self) -> List[Instrument]:
-        """Fetch all available currency pairs from Bitbank."""
-        from nautilus_trader.model.instruments import CryptoInstrument
-        from nautilus_trader.model.currencies import Currency
-        from nautilus_trader.model.enums import AssetType
+        from nautilus_trader.model.instruments import CurrencyPair
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from nautilus_trader.model.objects import Price, Quantity, Currency
+        from nautilus_trader.model.enums import CurrencyType
+        import nautilus_trader.model.currencies as currencies
         
+        def get_currency(code: str) -> Currency:
+            code = code.upper()
+            if hasattr(currencies, code):
+                return getattr(currencies, code)
+            return Currency(code, 8, 0, code, CurrencyType.CRYPTO)
+
         try:
-            resp_json = await self._rest_client.get_pairs_py()
-            data = json.loads(resp_json)
+            res_json = await self._rest_client.get_pairs_py()
+            data = json.loads(res_json)
             pairs = data.get("pairs", [])
             
             instruments = []
             for p in pairs:
-                if p.get("is_suspended"):
+                if not p.get("is_enabled", True) or p.get("is_suspended", False):
                     continue
+                    
+                base = p.get("base_asset").upper()
+                quote = p.get("quote_asset").upper()
+                pair_name = p.get("name") # e.g. "btc_jpy"
+                symbol = f"{base}/{quote}"
                 
-                name = p["name"] # e.g. btc_jpy
-                base_asset = p["base_asset"].upper()
-                quote_asset = p["quote_asset"].upper()
-                
-                # Convert btc_jpy -> BTC/JPY
-                symbol = f"{base_asset}/{quote_asset}"
-                
-                inst = CryptoInstrument(
-                    instrument_id=InstrumentId.from_str(f"{symbol}.{self.venue.value}"),
-                    raw_symbol=Symbol(name),
-                    base_currency=Currency.from_str(base_asset),
-                    quote_currency=Currency.from_str(quote_asset),
-                    price_precision=p["price_digits"],
-                    size_precision=p["amount_digits"],
-                    price_increment=Price.from_str(p["limit_unit_amount"]),
-                    size_increment=Quantity.from_str(p["unit_amount"]),
-                    lot_size=Quantity.from_str("1"),
-                    max_quantity=Quantity.from_str(p["max_amount"]),
-                    min_quantity=Quantity.from_str(p["min_amount"]),
-                    max_notional=None,
-                    min_notional=None,
-                    margins=False,
-                    is_inverse=False,
-                    maker_fee=Decimal(p["maker_fee_rate"]),
-                    taker_fee=Decimal(p["taker_fee_rate"]),
-                    ts_event=self._clock.timestamp_ns(),
-                    ts_init=self._clock.timestamp_ns(),
+                instrument = CurrencyPair(
+                    InstrumentId.from_str(f"{symbol}.BITBANK"),
+                    Symbol(pair_name),
+                    get_currency(base),
+                    get_currency(quote),
+                    int(p.get("price_digits")),
+                    int(p.get("amount_digits")),
+                    Price.from_str(f"{10.0**-p.get('price_digits'):.10f}".rstrip('0').rstrip('.')),
+                    Quantity.from_str(f"{10.0**-p.get('amount_digits'):.10f}".rstrip('0').rstrip('.')),
+                    Quantity.from_str(p.get("min_amount") or "0"),
+                    True, # is_retradable
                 )
-                instruments.append(inst)
+                instruments.append(instrument)
             
             self._logger.info(f"Fetched {len(instruments)} instruments from Bitbank")
             return instruments
             
         except Exception as e:
-            self._logger.error(f"Failed to fetch instruments: {e}")
+            self._logger.error(f"Error fetching instruments: {e}")
             return []
 
-    # For testing from test_adapter.py (legacy)
-    async def fetch_ticker(self, instrument_id: str):
-        symbol = instrument_id.split(".")[0]
-        pair = symbol.replace("/", "_").lower()
-        json_str = await self._rest_client.get_ticker_py(pair)
-        return json.loads(json_str)
+

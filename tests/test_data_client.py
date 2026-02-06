@@ -8,58 +8,52 @@ from nautilus_trader.model.data import QuoteTick, TradeTick
 from nautilus_trader.model.currencies import JPY
 
 @pytest.mark.asyncio
-async def test_connect_subscribe(data_client, mock_rust_websocket):
+async def test_connect_subscribe(data_client, mock_rust_data_client):
     """Test connection and subscription logic."""
-    data_client.connect()
-    # connect() is synchronous but launches a task. Wait a bit for the task to run.
-    await asyncio.sleep(0.1)
+    await data_client._connect()
     
     # Check if connect was called on the underlying Rust client
-    assert data_client._ws_client.connect_py_called
-    # assert data_client._ws_client.set_callback_called # This is called in __init__, so always true
-    # assert data_client._ws_client.set_disconnect_callback_called
+    assert data_client._rust_client.connect.called
 
     instrument = InstrumentId.from_str("BTC/JPY.BITBANK")
     
-    await data_client.subscribe_quote_ticks(instrument)
-    # Ensure it's in the internal map for the handler to find it
-    data_client._subscribed_instruments[instrument.value] = MagicMock()
-    data_client._subscribed_instruments[instrument.value].id = instrument
+    from nautilus_trader.model.instruments import Instrument
+    mock_instrument = MagicMock(spec=Instrument)
+    mock_instrument.id = instrument
     
-    # Bitbank uses lower case pair names: btc_jpy
-    expected_pair = "btc_jpy"
+    await data_client.subscribe([mock_instrument])
+    # Ensure it's in the internal map for the handler to find it
+    data_client._subscribed_instruments["btc_jpy"] = MagicMock()
+    data_client._subscribed_instruments["btc_jpy"].id = instrument
     
     # Verify subscribe called
-    assert data_client._ws_client.subscribe_called
-    
-    last_call = data_client._ws_client.calls[-1]
-    assert last_call[0] == "subscribe"
+    assert data_client._rust_client.subscribe.called
+    expected_rooms = ["ticker_btc_jpy", "transactions_btc_jpy", "depth_whole_btc_jpy", "depth_diff_btc_jpy"]
+    data_client._rust_client.subscribe.assert_called_with(expected_rooms)
     
 @pytest.mark.asyncio
 async def test_handle_ticker(data_client, mock_clock):
     """Test parsing of ticker messages."""
     instrument = InstrumentId.from_str("BTC/JPY.BITBANK")
-    data_client._subscribed_instruments[instrument.value] = MagicMock()
-    data_client._subscribed_instruments[instrument.value].id = instrument
+    data_client._subscribed_instruments["btc_jpy"] = MagicMock()
+    data_client._subscribed_instruments["btc_jpy"].id = instrument
 
-    data_client.connect()
-    await asyncio.sleep(0.1)
+    await data_client._connect()
     
-    # Simulate incoming JSON message
-    # Ticker format: {"room_name": "ticker_btc_jpy", "message": {"data": {...}}}
-    msg_json = json.dumps({
-        "room_name": "ticker_btc_jpy",
-        "message": {
-            "data": {
-                "sell": "1000000",
-                "buy": "999000",
-                "timestamp": 1600000000000
-            }
-        }
-    })
+    from nautilus_bitbank import Ticker
+    # Simulate incoming Rust object
+    data_obj = Ticker(
+        sell="1000000",
+        buy="999000",
+        high="1005000",
+        low="990000",
+        last="999500",
+        vol="12.5",
+        timestamp=1600000000000
+    )
     
-    # Manually trigger callback
-    data_client._handle_message(msg_json)
+    # Manually trigger callback from Rust
+    data_client._handle_rust_data("ticker_btc_jpy", data_obj)
     
     # Verify QuoteTick emitted via _handle_data
     assert data_client._handle_data.called
@@ -76,35 +70,63 @@ async def test_handle_ticker(data_client, mock_clock):
 async def test_handle_transactions(data_client):
     """Test parsing of transaction messages."""
     instrument = InstrumentId.from_str("BTC/JPY.BITBANK")
-    data_client._subscribed_instruments[instrument.value] = MagicMock()
-    data_client._subscribed_instruments[instrument.value].id = instrument
+    data_client._subscribed_instruments["btc_jpy"] = MagicMock()
+    data_client._subscribed_instruments["btc_jpy"].id = instrument
 
-    data_client.connect()
-    await asyncio.sleep(0.1)
+    await data_client._connect()
     
-    msg_json = json.dumps({
-        "room_name": "transactions_btc_jpy",
-        "message": {
-            "data": {
-                "transactions": [
-                    {
-                        "transaction_id": 12345,
-                        "side": "buy",
-                        "price": "1000000",
-                        "amount": "0.01",
-                        "executed_at": 1600000000000
-                    }
-                ]
-            }
-        }
-    })
+    from nautilus_bitbank import Transaction, Transactions
+    tx = Transaction(
+        transaction_id=12345,
+        side="buy",
+        price="1000000",
+        amount="0.01",
+        executed_at=1600000000000
+    )
+    data_obj = Transactions(transactions=[tx])
     
-    data_client._handle_message(msg_json)
+    data_client._handle_rust_data("transactions_btc_jpy", data_obj)
     
     assert data_client._handle_data.called
     args = data_client._handle_data.call_args[0]
     tick: TradeTick = args[0]
     
+    from nautilus_trader.model.objects import Quantity
     assert tick.price == 1000000
-    assert tick.qty == 0.01
-    assert tick.trade_id == "12345"
+    assert tick.size == Quantity.from_str("0.01")
+    from nautilus_trader.model.identifiers import TradeId
+    assert tick.trade_id == TradeId("12345")
+
+@pytest.mark.asyncio
+async def test_handle_depth(data_client):
+    """Test parsing of depth messages using OrderBook object."""
+    instrument = InstrumentId.from_str("BTC/JPY.BITBANK")
+    data_client._subscribed_instruments["btc_jpy"] = MagicMock()
+    data_client._subscribed_instruments["btc_jpy"].id = instrument
+
+    await data_client._connect()
+    
+    from nautilus_bitbank import OrderBook, Depth
+    # Create a Rust managed OrderBook
+    book = OrderBook("btc_jpy")
+    depth = Depth(
+        asks=[["1000001", "1.0"], ["1000002", "2.0"]],
+        bids=[["999999", "3.0"], ["999998", "4.0"]],
+        timestamp=1600000000000,
+        s=100
+    )
+    book.apply_whole(depth)
+    
+    # Trigger callback
+    data_client._handle_rust_data("depth_whole_btc_jpy", book)
+    
+    assert data_client._handle_data.called
+    args = data_client._handle_data.call_args[0]
+    from nautilus_trader.model.data import OrderBookDeltas
+    snapshot: OrderBookDeltas = args[0]
+    
+    assert snapshot.instrument_id.value == "BTC/JPY.BITBANK"
+    # CLEAR + 2 asks + 2 bids = 5 deltas
+    assert len(snapshot.deltas) == 5
+    from nautilus_trader.model.enums import BookAction
+    assert snapshot.deltas[0].action == BookAction.CLEAR

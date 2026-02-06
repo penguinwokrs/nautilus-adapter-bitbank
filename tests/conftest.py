@@ -1,5 +1,6 @@
 import asyncio
 import pytest
+import json
 from unittest.mock import MagicMock, AsyncMock
 
 from nautilus_trader.config import StreamingConfig
@@ -52,126 +53,62 @@ def exec_config():
         use_pubnub=True,
     )
 
-class ManualMockWebSocketClient:
+class ManualMockRustDataClient:
     def __init__(self):
-        self.connect_py_called = False
-        self.subscribe_called = False
-        self.set_callback_called = False
-        self.set_disconnect_callback_called = False
-        self.calls = []
-
-    async def connect_py(self):
-        print("DEBUG: ManualMockWebSocketClient.connect_py called")
-        self.connect_py_called = True
-        self.calls.append(("connect_py", ()))
-        return "CONNECTED"
-
-    async def connect(self, uri=None):
-        print("DEBUG: ManualMockWebSocketClient.connect called")
-        self.calls.append(("connect", (uri,)))
-        return "CONNECTED"
-
-    async def disconnect(self):
-        pass
-
-    async def subscribe(self, *args):
-        self.subscribe_called = True
-        self.calls.append(("subscribe", args))
-
-    def set_callback(self, cb):
-        self.set_callback_called = True
-
-    def set_disconnect_callback(self, cb):
-        self.set_disconnect_callback_called = True
-
-    # helper to check if called (mock interface)
-    @property
-    def called(self):
-        return len(self.calls) > 0 # generic called check
+        self.connect = AsyncMock()
+        self.disconnect = AsyncMock()
+        self.subscribe = AsyncMock()
+        self.set_data_callback = MagicMock()
 
 @pytest.fixture
-def mock_rust_websocket(monkeypatch):
+def mock_rust_data_client(monkeypatch):
     import nautilus_bitbank.data as data_module
-    
-    # We return the class, but monkeypatch needs the class name 
-    # to be instantiated by BitbankDataClient. 
-    # But BitbankDataClient instantiates it as bitbank.BitbankWebSocketClient()
-    
-    # We need a way to return the instance to the test
-    
-    # Strategy: define a global or closure variable to hold the last instance
     
     class Factory:
         instance = None
         
     def MockClass():
-        instance = ManualMockWebSocketClient()
-        Factory.instance = instance
-        return instance
+        inst = ManualMockRustDataClient()
+        Factory.instance = inst
+        return inst
 
-    monkeypatch.setattr(data_module.bitbank, "BitbankWebSocketClient", MockClass)
-    return Factory # returns a factory/holder so tests can access the instance
+    monkeypatch.setattr(data_module.bitbank, "BitbankDataClient", MockClass)
+    return Factory
 
-class ManualMockRestClient:
-    def __init__(self, key, secret):
+class ManualMockRustExecutionClient:
+    def __init__(self, key, secret, sub_key, timeout_ms, proxy_url):
         self.key = key
         self.secret = secret
-        self.create_order_py_calls = []
-        self.cancel_order_py_calls = []
-        self.create_order_py_return = "{}"
-        self.cancel_order_py_return = "{}"
-        # For methods that need standard Mock interface
-        self.create_order_py_mock = MagicMock() 
-        self.cancel_order_py_mock = MagicMock()
-        self.get_order_py = AsyncMock()
-        self.get_trade_history_py = AsyncMock()
-        self.get_pubnub_auth_py = AsyncMock(return_value='{"pubnub_channel": "ch", "pubnub_token": "tk"}')
-
-    async def create_order_py(self, *args):
-        self.create_order_py_calls.append(args)
-        # Delegate to MagicMock for assertions or return value
-        self.create_order_py_mock(*args) # record call
-        return self.create_order_py_mock.return_value or self.create_order_py_return
-
-    async def cancel_order_py(self, *args):
-        self.cancel_order_py_calls.append(args)
-        self.cancel_order_py_mock(*args)
-        return self.cancel_order_py_mock.return_value or self.cancel_order_py_return
-
-class ManualMockPubNubClient:
-    def __init__(self):
-        self.connect_py = AsyncMock()
-        self.stop_py = AsyncMock()
-        self.set_callback = MagicMock()
+        self.sub_key = sub_key
+        self.timeout_ms = timeout_ms
+        self.proxy_url = proxy_url
+        self.submit_order = AsyncMock()
+        self.cancel_order = AsyncMock()
+        self.connect = AsyncMock()
+        self.set_order_callback = MagicMock()
+        self.get_order = AsyncMock()
+        self.get_trade_history = AsyncMock()
 
 @pytest.fixture
-def mock_rust_rest_and_pubnub(monkeypatch):
+def mock_rust_execution_client(monkeypatch):
     import nautilus_bitbank.execution as exec_module
     
     class Factory:
-        rest_instance = None
-        pubnub_instance = None
+        instance = None
 
-    def RestMock(key, secret):
-        inst = ManualMockRestClient(key, secret)
-        Factory.rest_instance = inst
-        # Connect the inner AsyncMock's return_value to attribute for easier setting in tests
-        inst.create_order_py_mock.return_value = None 
-        inst.cancel_order_py_mock.return_value = None
-        return inst
-        
-    def PubNubMock():
-        inst = ManualMockPubNubClient()
-        Factory.pubnub_instance = inst
+    def MockClient(key, secret, sub_key, timeout_ms, proxy_url):
+        inst = ManualMockRustExecutionClient(key, secret, sub_key, timeout_ms, proxy_url)
+        Factory.instance = inst
+        # Default return values
+        inst.submit_order.return_value = json.dumps({"order_id": 123456789})
+        inst.get_order.return_value = json.dumps({"order_id": 123456789, "status": "UNFILLED"})
         return inst
 
-    monkeypatch.setattr(exec_module.bitbank, "BitbankRestClient", RestMock)
-    monkeypatch.setattr(exec_module.bitbank, "PubNubClient", PubNubMock, raising=False)
-    
+    monkeypatch.setattr(exec_module.bitbank, "BitbankExecutionClient", MockClient)
     return Factory
 
 @pytest.fixture
-def data_client(event_loop, data_config, mock_msgbus, mock_cache, mock_clock, mock_rust_websocket):
+def data_client(event_loop, data_config, mock_msgbus, mock_cache, mock_clock, mock_rust_data_client):
     client = BitbankDataClient(
         loop=event_loop,
         config=data_config,
@@ -179,21 +116,17 @@ def data_client(event_loop, data_config, mock_msgbus, mock_cache, mock_clock, mo
         cache=mock_cache,
         clock=mock_clock,
     )
-    # Ensure client uses our mock instance
-    # Since we monkeypatched the class, client._ws_client should be our ManualMockWebSocketClient
-    # Monkeypatching extension modules is flaky. Ensure the mock is used.
-    client._ws_client = mock_rust_websocket.instance
+    
+    if mock_rust_data_client.instance:
+        client._rust_client = mock_rust_data_client.instance
     
     # Mock _handle_data to avoid dependency on MessageBus implementation details
     client._handle_data = MagicMock()
     return client
 
 @pytest.fixture
-def exec_client(event_loop, exec_config, mock_msgbus, mock_cache, mock_clock, mock_rust_rest_and_pubnub):
+def exec_client(event_loop, exec_config, mock_msgbus, mock_cache, mock_clock, mock_rust_execution_client):
     provider = MagicMock(spec=InstrumentProvider)
-    # provider needs to pass strict type checks?
-    # If MagicMock fails, we might need a real stub. 
-    # But let's assume monkeypatching Rest/PubNub works.
     
     client = BitbankExecutionClient(
         loop=event_loop,
@@ -205,9 +138,13 @@ def exec_client(event_loop, exec_config, mock_msgbus, mock_cache, mock_clock, mo
     )
     
     # Ensure mocks
-    if mock_rust_rest_and_pubnub.rest_instance:
-        client._client = mock_rust_rest_and_pubnub.rest_instance
-    if mock_rust_rest_and_pubnub.pubnub_instance:
-        client._pubnub_client = mock_rust_rest_and_pubnub.pubnub_instance
+    if mock_rust_execution_client.instance:
+        client._rust_client = mock_rust_execution_client.instance
+    
+    # Patch for tests expecting _active_orders
+    if not hasattr(client, "_active_orders"):
+        client._active_orders = {}
+    if not hasattr(client, "_order_states"):
+        client._order_states = {}
         
     return client

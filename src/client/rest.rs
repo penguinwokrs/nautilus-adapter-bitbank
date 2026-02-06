@@ -1,10 +1,10 @@
-use reqwest::{Client, Method, StatusCode};
-use serde::{de::DeserializeOwned, Serialize};
+use reqwest::{Client, Method};
+use serde::de::DeserializeOwned;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
 use crate::error::BitbankError;
-use crate::model::{BitbankResponse, BitbankErrorResponse, market_data::{Ticker, Depth, PairsContainer}, order::{Order, Trades}, pubnub::PubNubConnectParams};
+use crate::model::{BitbankErrorResponse, market_data::{Ticker, Depth, PairsContainer}, order::{Order, Trades}, pubnub::PubNubConnectParams};
 use std::time::{SystemTime, UNIX_EPOCH};
 use pyo3::prelude::*;
 
@@ -23,9 +23,18 @@ pub struct BitbankRestClient {
 #[pymethods]
 impl BitbankRestClient {
     #[new]
-    pub fn new(api_key: String, api_secret: String) -> Self {
+    pub fn new(api_key: String, api_secret: String, timeout_ms: u64, proxy_url: Option<String>) -> Self {
+        let mut builder = Client::builder()
+            .timeout(std::time::Duration::from_millis(timeout_ms));
+            
+        if let Some(proxy) = proxy_url {
+            if let Ok(p) = reqwest::Proxy::all(proxy) {
+                builder = builder.proxy(p);
+            }
+        }
+
         Self {
-            client: Client::new(),
+            client: builder.build().unwrap_or_else(|_| Client::new()),
             api_key,
             api_secret,
             base_url_public: "https://public.bitbank.cc".to_string(),
@@ -37,7 +46,7 @@ impl BitbankRestClient {
         let client = self.clone();
         let pair = pair.clone();
         let future = async move {
-            let res = client.get_ticker(&pair).await.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let res = client.get_ticker(&pair).await.map_err(PyErr::from)?;
             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
             Ok(json)
         };
@@ -58,7 +67,7 @@ impl BitbankRestClient {
             let price_ref = price.as_deref();
             let res = client.create_order(&pair, &amount, price_ref, &side, &order_type)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyErr::from)?;
                 
             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
             Ok(json)
@@ -73,7 +82,7 @@ impl BitbankRestClient {
             
             let res = client.cancel_order(&pair, order_id_u64)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyErr::from)?;
                 
             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
             Ok(json)
@@ -88,7 +97,7 @@ impl BitbankRestClient {
             
             let res = client.get_order(&pair, order_id_u64)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyErr::from)?;
                 
             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
             Ok(json)
@@ -106,7 +115,7 @@ impl BitbankRestClient {
             
             let res = client.get_trade_history(&pair, order_id_u64)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyErr::from)?;
                 
             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
             Ok(json)
@@ -119,7 +128,7 @@ impl BitbankRestClient {
         let future = async move {
             let res = client.get_pairs()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyErr::from)?;
                 
             let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
             Ok(json)
@@ -130,31 +139,8 @@ impl BitbankRestClient {
     pub fn get_pubnub_auth_py(&self, py: Python) -> PyResult<PyObject> {
         let client = self.clone();
         let future = async move {
-             let endpoint = "/v1/user/subscribe";
-             let url = format!("{}{}", client.base_url_private, endpoint);
-             
-             let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                .to_string();
-             
-             let text_to_sign = format!("{}{}", timestamp, endpoint);
-             let signature = client.generate_signature(&text_to_sign);
-
-             let response = client.client.get(&url)
-                .header("ACCESS-KEY", &client.api_key)
-                .header("ACCESS-NONCE", &timestamp)
-                .header("ACCESS-SIGNATURE", signature)
-                .send()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-             let text = response.text().await.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-             // println!("Raw PubNub Resp: {}", text);
-
-             let res: PubNubConnectParams = serde_json::from_str(&text)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse Error: {}", e)))?;
+             let res = client.get_pubnub_auth().await
+                .map_err(PyErr::from)?;
 
              let json = serde_json::to_string(&res).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
              Ok(json)
@@ -163,8 +149,36 @@ impl BitbankRestClient {
     }
 }
 
-// Internal methods definitions... (same as before)
+// Internal pure Rust implementations
 impl BitbankRestClient {
+    pub async fn get_pubnub_auth(&self) -> Result<PubNubConnectParams, BitbankError> {
+         let endpoint = "/v1/user/subscribe";
+         let url = format!("{}{}", self.base_url_private, endpoint);
+         
+         let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+         
+         let text_to_sign = format!("{}{}", timestamp, endpoint);
+         let signature = self.generate_signature(&text_to_sign);
+
+         let response = self.client.get(&url)
+            .header("ACCESS-KEY", &self.api_key)
+            .header("ACCESS-NONCE", &timestamp)
+            .header("ACCESS-SIGNATURE", signature)
+            .send()
+            .await
+            .map_err(|e| BitbankError::Unknown(e.to_string()))?;
+
+         let text = response.text().await.map_err(|e| BitbankError::Unknown(e.to_string()))?;
+
+         let res: PubNubConnectParams = serde_json::from_str(&text)
+            .map_err(|e| BitbankError::Unknown(format!("Parse Error: {}", e)))?;
+         
+         Ok(res)
+    }
     // ... (rest of the implementation omitted for brevity but logic must persist)
     // To ensure I don't delete existing internal methods, I must include them.
     // I can assume previous view_file content.
@@ -274,7 +288,19 @@ impl BitbankRestClient {
 
     pub async fn get_pairs(&self) -> Result<PairsContainer, BitbankError> {
         let endpoint = "/v1/spot/pairs";
-        self.request(Method::GET, endpoint, None, None, false).await
+        let url = format!("{}{}", self.base_url_private, endpoint);
+        let response = self.client.get(&url).send().await?;
+        let text = response.text().await?;
+        
+        // Match the parsing logic in 'request'
+        let val: serde_json::Value = serde_json::from_str(&text)?;
+        if val.get("success").and_then(|v| v.as_i64()) == Some(1) {
+            if let Some(data) = val.get("data") {
+                let res: PairsContainer = serde_json::from_value(data.clone())?;
+                return Ok(res);
+            }
+        }
+        Err(BitbankError::Unknown(format!("Failed to fetch pairs: {}", text)))
     }
 
     // Keep all other methods as previously defined
