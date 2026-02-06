@@ -14,10 +14,10 @@ class BitbankDataClientFactory(LiveDataClientFactory):
     """Factory for creating BitbankDataClient instances."""
     
     @classmethod
-    def create(cls, loop, msgbus, cache, clock, name=None, config=None, **kwargs):
+    def create(cls, loop, msgbus, cache, clock, instrument_provider=None, name=None, config=None, **kwargs):
         if config is None:
             raise ValueError("Config required for BitbankDataClient")
-        return BitbankDataClient(loop, config, msgbus, cache, clock)
+        return BitbankDataClient(loop, config, msgbus, cache, clock, instrument_provider)
 
 
 class BitbankExecutionClientFactory(LiveExecClientFactory):
