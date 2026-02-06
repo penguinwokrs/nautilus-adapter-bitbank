@@ -3,7 +3,7 @@ import json
 import logging
 from typing import List
 
-from nautilus_trader.live.data_client import LiveDataClient
+from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.identifiers import ClientId, Venue
 from .config import BitbankDataClientConfig
@@ -14,12 +14,17 @@ except ImportError:
     import _nautilus_bitbank as bitbank
 
 
-class BitbankDataClient(LiveDataClient):
+class BitbankDataClient(LiveMarketDataClient):
     """
     Rust-First implementation wrapper.
     Actual logic resides in bitbank.BitbankDataClient (Rust).
     """
-    def __init__(self, loop, config: BitbankDataClientConfig, msgbus, cache, clock):
+    def __init__(self, loop, config: BitbankDataClientConfig, msgbus, cache, clock, instrument_provider=None):
+        # Create a minimal instrument provider if not provided
+        if instrument_provider is None:
+            from nautilus_trader.common.providers import InstrumentProvider
+            instrument_provider = InstrumentProvider()
+        
         super().__init__(
             loop=loop, 
             client_id=ClientId("BITBANK-DATA"),
@@ -27,6 +32,7 @@ class BitbankDataClient(LiveDataClient):
             msgbus=msgbus, 
             cache=cache, 
             clock=clock, 
+            instrument_provider=instrument_provider,
             config=config
         )
         self.config = config
@@ -68,6 +74,7 @@ class BitbankDataClient(LiveDataClient):
             ])
         
         if rooms:
+            self._logger.info(f"Subscribing to rooms: {rooms}")
             await self._rust_client.subscribe(rooms)
 
     async def unsubscribe(self, instruments: List[Instrument]):
@@ -79,6 +86,7 @@ class BitbankDataClient(LiveDataClient):
         room_name: e.g. "ticker_btc_jpy"
         data: PyObject (Ticker, Depth, or Transactions) from Rust
         """
+        # self._logger.debug(f"Received data for {room_name}")
         try:
             # Extract pair and type
             if room_name.startswith("ticker_"):
@@ -232,5 +240,53 @@ class BitbankDataClient(LiveDataClient):
         except Exception as e:
             self._logger.error(f"Error fetching instruments: {e}")
             return []
+
+    async def _subscribe_quote_ticks(self, command):
+        instrument_id = command.instrument_id if hasattr(command, 'instrument_id') else command
+        instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None and hasattr(self, '_cache'):
+            instrument = self._cache.instrument(instrument_id)
+            
+        if instrument:
+            await self.subscribe([instrument])
+        else:
+            self._logger.error(f"Could not find instrument {instrument_id} in provider or cache")
+
+    async def _unsubscribe_quote_ticks(self, instrument_id):
+        pass
+
+    async def _subscribe_trade_ticks(self, command):
+        instrument_id = command.instrument_id if hasattr(command, 'instrument_id') else command
+        instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None and hasattr(self, '_cache'):
+            instrument = self._cache.instrument(instrument_id)
+
+        if instrument:
+            await self.subscribe([instrument])
+        else:
+            self._logger.error(f"Could not find instrument {instrument_id} in provider or cache")
+
+    async def _unsubscribe_trade_ticks(self, instrument_id):
+        pass
+
+    async def _subscribe_order_book_deltas(self, command):
+        instrument_id = command.instrument_id if hasattr(command, 'instrument_id') else command
+        instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None and hasattr(self, '_cache'):
+            instrument = self._cache.instrument(instrument_id)
+
+        if instrument:
+            await self.subscribe([instrument])
+        else:
+            self._logger.error(f"Could not find instrument {instrument_id} in provider or cache")
+
+    async def _unsubscribe_order_book_deltas(self, instrument_id):
+        pass
+    
+    async def _subscribe_order_book_snapshots(self, instrument_id):
+        pass
+
+    async def _unsubscribe_order_book_snapshots(self, instrument_id):
+        pass
 
 
