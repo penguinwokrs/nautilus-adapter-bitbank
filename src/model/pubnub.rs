@@ -9,9 +9,8 @@ pub struct PubNubMessage {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct PubNubConnectParams {
-    pub pubnub_auth_key: String,
-    pub pubnub_uuid: String,
     pub pubnub_channel: String,
+    pub pubnub_token: String,
 }
 
 #[cfg(test)]

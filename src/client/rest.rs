@@ -152,37 +152,14 @@ impl BitbankRestClient {
 // Internal pure Rust implementations
 impl BitbankRestClient {
     pub async fn get_pubnub_auth(&self) -> Result<PubNubConnectParams, BitbankError> {
-         let endpoint = "/v1/user/subscribe";
-         let url = format!("{}{}", self.base_url_private, endpoint);
-         
-         let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-            .to_string();
-         
-         let text_to_sign = format!("{}{}", timestamp, endpoint);
-         let signature = self.generate_signature(&text_to_sign);
-
-         let response = self.client.get(&url)
-            .header("ACCESS-KEY", &self.api_key)
-            .header("ACCESS-NONCE", &timestamp)
-            .header("ACCESS-SIGNATURE", signature)
-            .send()
-            .await
-            .map_err(|e| BitbankError::Unknown(e.to_string()))?;
-
-         let text = response.text().await.map_err(|e| BitbankError::Unknown(e.to_string()))?;
-
-         let res: PubNubConnectParams = serde_json::from_str(&text)
-            .map_err(|e| BitbankError::Unknown(format!("Parse Error: {}", e)))?;
-         
-         Ok(res)
+        let endpoint = "/v1/user/subscribe";
+        self.request(Method::GET, endpoint, None, None, true).await
     }
-    // ... (rest of the implementation omitted for brevity but logic must persist)
-    // To ensure I don't delete existing internal methods, I must include them.
-    // I can assume previous view_file content.
-    
+
+    pub async fn get_pairs(&self) -> Result<PairsContainer, BitbankError> {
+        let endpoint = "/v1/spot/pairs";
+        self.request(Method::GET, endpoint, None, None, true).await
+    }    
     fn generate_signature(&self, text: &str) -> String {
         let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
             .expect("HMAC can take key of any size");
@@ -264,8 +241,13 @@ impl BitbankRestClient {
         
         if success == 1 {
             if let Some(data) = val.get("data") {
-                let res: T = serde_json::from_value(data.clone())?;
-                Ok(res)
+                match serde_json::from_value::<T>(data.clone()) {
+                    Ok(res) => Ok(res),
+                    Err(e) => {
+                        println!("RB: Parse Error on data: {}. Error: {}", data, e);
+                        Err(BitbankError::Unknown(format!("Parse Error: {}", e)))
+                    }
+                }
             } else {
                 Err(BitbankError::Unknown(format!("Success=1 but no data. Body: {}", text)))
             }
@@ -286,24 +268,6 @@ impl BitbankRestClient {
         self.request(Method::GET, &endpoint, None, None, false).await
     }
 
-    pub async fn get_pairs(&self) -> Result<PairsContainer, BitbankError> {
-        let endpoint = "/v1/spot/pairs";
-        let url = format!("{}{}", self.base_url_private, endpoint);
-        let response = self.client.get(&url).send().await?;
-        let text = response.text().await?;
-        
-        // Match the parsing logic in 'request'
-        let val: serde_json::Value = serde_json::from_str(&text)?;
-        if val.get("success").and_then(|v| v.as_i64()) == Some(1) {
-            if let Some(data) = val.get("data") {
-                let res: PairsContainer = serde_json::from_value(data.clone())?;
-                return Ok(res);
-            }
-        }
-        Err(BitbankError::Unknown(format!("Failed to fetch pairs: {}", text)))
-    }
-
-    // Keep all other methods as previously defined
     pub async fn get_depth(&self, pair: &str) -> Result<Depth, BitbankError> {
         let endpoint = format!("/{}/depth", pair);
         self.request(Method::GET, &endpoint, None, None, false).await

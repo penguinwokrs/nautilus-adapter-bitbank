@@ -80,16 +80,15 @@ pub struct PairInfo {
     pub maker_fee_rate_quote: String,
     pub taker_fee_rate_quote: String,
     pub unit_amount: String,
-    #[serde(default)]
     pub limit_unit_amount: Option<String>,
     pub min_amount: Option<String>,
     pub max_amount: Option<String>,
     pub price_digits: i32,
     pub amount_digits: i32,
-    #[serde(rename = "is_suspended", default)]
-    pub is_suspended_legacy: Option<bool>, // Some versions use is_suspended
-    #[serde(rename = "is_enabled", default)]
-    pub is_enabled: Option<bool>, 
+    #[serde(default)]
+    pub is_suspended: bool,
+    #[serde(default)]
+    pub is_enabled: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
