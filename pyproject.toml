@@ -21,3 +21,10 @@ test = [
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "nautilus_bitbank._nautilus_bitbank"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "live: marks tests as requiring live API connection (deselect with '-m \"not live\"')",
+    "order: marks tests that execute real orders (deselect with '-m \"not order\"')",
+]
