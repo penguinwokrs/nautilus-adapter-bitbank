@@ -4,6 +4,14 @@ target/
 #maturin
 .maturin/
 
+#compiled extensions (platform-specific build artifacts)
+*.so
+*.dylib
+*.pyd
+nautilus_bitbank/*.so
+nautilus_bitbank/*.dylib
+nautilus_bitbank/*.pyd
+
 #other
 .DS_Store
 
