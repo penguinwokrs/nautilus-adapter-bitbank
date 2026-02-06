@@ -97,7 +97,7 @@ class BitbankExecutionClient(LiveExecutionClient):
 
             amount = str(order.quantity)
             
-            client_id = str(command.client_order_id)
+            client_id = str(order.client_order_id)
             resp_json = await self._rust_client.submit_order(
                 pair,
                 amount,
@@ -187,6 +187,9 @@ class BitbankExecutionClient(LiveExecutionClient):
             
         # Instrument to get quote currency for commission Money object
         instrument = self._instrument_provider.find(order.instrument_id)
+        if instrument is None and hasattr(self, '_cache'):
+            instrument = self._cache.instrument(order.instrument_id)
+
         quote_currency = JPY if not instrument else instrument.quote_currency
         
         await self._process_order_update(order, venue_order_id, pair, quote_currency, data)
