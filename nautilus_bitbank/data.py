@@ -165,32 +165,23 @@ class BitbankDataClient(LiveDataClient):
         if not instrument:
             return
 
-        from nautilus_trader.model.data import OrderBookUpdate
+        # from nautilus_trader.model.data import OrderBookUpdate
         
         # Bitbank depth_whole data: {"bids": [["price", "amount"], ...], "asks": [...], "timestamp": ...}
-        bids_raw = data.get("bids", [])
-        asks_raw = data.get("asks", [])
+        # bids_raw = data.get("bids", [])
+        # asks_raw = data.get("asks", [])
         ts_event = int(data.get("timestamp", 0)) * 1_000_000
         
-        # For a full snapshot in Nautilus, we can send it as an OrderBookUpdate
-        # Note: In production, incremental updates (depth) are better for performance, 
-        # but depth_whole is easier for a start.
+        self._logger.warning(f"Snapshot received for {pair} but OrderBookUpdate is not supported in this version.")
         
-        bids = [(Price.from_str(b[0]), Quantity.from_str(b[1])) for b in bids_raw]
-        asks = [(Price.from_str(a[0]), Quantity.from_str(a[1])) for a in asks_raw]
-        
-        # Sort bids descending, asks ascending (Nautilus expects this)
-        bids.sort(key=lambda x: x[0], reverse=True)
-        asks.sort(key=lambda x: x[0])
-
-        update = OrderBookUpdate(
-            instrument_id=instrument.id,
-            bids=bids,
-            asks=asks,
-            ts_event=ts_event,
-            ts_init=self._clock.timestamp_ns(),
-        )
-        self._handle_data(update)
+        # update = OrderBookUpdate(
+        #     instrument_id=instrument.id,
+        #     bids=bids,
+        #     asks=asks,
+        #     ts_event=ts_event,
+        #     ts_init=self._clock.timestamp_ns(),
+        # )
+        # self._handle_data(update)
 
     def _handle_transactions(self, room_name: str, data: dict):
         pair = room_name.replace("transactions_", "")

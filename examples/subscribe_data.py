@@ -5,11 +5,10 @@ from typing import Optional
 
 from nautilus_trader.model.identifiers import Venue, InstrumentId
 from nautilus_trader.release import __version__
-from nautilus_trader.common.component import MessageBus
+from nautilus_trader.common.component import MessageBus, LiveClock
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.live.msgbus import LiveMessageBus
 from nautilus_trader.cache.cache import Cache
-from nautilus_trader.time.clock import LiveClock
 from nautilus_trader.config import StreamingConfig
 
 from nautilus_bitbank.config import BitbankDataClientConfig

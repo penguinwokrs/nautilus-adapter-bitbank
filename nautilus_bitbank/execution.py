@@ -151,6 +151,7 @@ class BitbankExecutionClient(LiveExecutionClient):
             # self._logger.info(f"PubNub Message: {data}")
             
             # Parse order update
+            status_str = data.get("status")
             if status_str in ("FILLED", "PARTIALLY_FILLED", "CANCELED_PARTIALLY_FILLED", "FULLY_FILLED"):
                  # Trigger immediate update logic
                  order = self._active_orders.get(venue_order_id)

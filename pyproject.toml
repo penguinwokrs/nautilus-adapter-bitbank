@@ -11,6 +11,13 @@ dependencies = [
     "nautilus-trader>=1.204.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-mock",
+]
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "nautilus_bitbank._nautilus_bitbank"
