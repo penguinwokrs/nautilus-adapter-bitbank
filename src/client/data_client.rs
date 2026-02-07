@@ -167,7 +167,7 @@ impl BitbankDataClient {
                                             // Store it for reconnection
                                             {
                                                 let mut subs = subs_arc.lock().await;
-                                                subs.insert(room_id.clone());
+                                                let _: bool = subs.insert(room_id);
                                             }
                                             let msg = format!("42[\"join-room\", \"{}\"]", room_id);
                                             if let Err(e) = write.send(Message::Text(msg)).await {
