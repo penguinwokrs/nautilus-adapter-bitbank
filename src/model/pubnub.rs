@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use crate::model::order::Order;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BitbankPubNubData {
