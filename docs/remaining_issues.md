@@ -25,7 +25,8 @@ Nautilus Trader 1.222.0 仕様への完全適合、PubNub を活用した約定�
 
 ### B. 追加機能 (Optional - Future)
 - [ ] **Backtest 互換性**: ヒストリカルデータの REST 取得プラグインの実装（現在は LIVE/PAPER のみ想定）。
-- [ ] **全銘柄の通貨登録**: ビットバンクの全 60+ 銘柄に対応するため、初期化時に通貨を InstrumentProvider に動的登録するロジックの追加。
+- [x] **全銘柄の通貨登録**: ExecutionClient 接続時にパブリックAPIから全ペアを取得し、未知の通貨を InstrumentProvider に動的登録するロジックを追加。
+
 
 ---
 ## 4. 検証済みフロー (Validated)
