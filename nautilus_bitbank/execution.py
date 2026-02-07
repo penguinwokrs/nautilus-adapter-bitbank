@@ -63,6 +63,9 @@ class BitbankExecutionClient(LiveExecutionClient):
         return self._account_id
 
     async def _connect(self):
+        # Register all currencies first to ensure AccountState can resolve them
+        await self._register_all_currencies()
+
         if self.config.use_pubnub:
             try:
                 # Delegate Auth and Connect to Rust
@@ -466,4 +469,77 @@ class BitbankExecutionClient(LiveExecutionClient):
 
     async def generate_position_status_reports(self, instrument_id=None):
         return []
+
+    async def _register_all_currencies(self):
+        """
+        Dynamically register all Bitbank currencies to the InstrumentProvider (Cache).
+        This allows handling assets that are not yet in nautilus_trader.model.currencies.
+        """
+        import json
+        import urllib.request
+        from nautilus_trader.model.currencies import Currency
+        try:
+            from nautilus_trader.model.enums import CurrencyType
+        except ImportError:
+            CurrencyType = None
+
+        url = "https://api.bitbank.cc/v1/spot/pairs"
+        
+        def fetch_pairs():
+            try:
+                with urllib.request.urlopen(url, timeout=10) as response:
+                    if response.status != 200:
+                        return None
+                    return json.loads(response.read().decode())
+            except Exception as e:
+                self.log.error(f"Failed to fetch pairs from Bitbank: {e}")
+                return None
+
+        # Run in executor to not block loop
+        try:
+            data = await self.loop.run_in_executor(None, fetch_pairs)
+        except Exception:
+            return
+
+        if not data or data.get("success") != 1:
+            return
+
+        pairs_list = data["data"]["pairs"]
+        codes = set()
+        for p in pairs_list:
+            codes.add(p["base_asset"].upper())
+            codes.add(p["quote_asset"].upper())
+
+        added_count = 0
+        from nautilus_trader.model import currencies as model_currencies
+
+        for code in codes:
+            # Check provider first
+            if hasattr(self._instrument_provider, "currency"):
+                if self._instrument_provider.currency(code):
+                    continue
+            
+            # Check globals
+            if getattr(model_currencies, code, None):
+                continue
+
+            # Create new
+            try:
+                ctype = CurrencyType.CRYPTO
+                if code in ("JPY", "USD", "EUR"):
+                    ctype = CurrencyType.FIAT
+                
+                # Use positional args for v1.222.0 compatibility
+                # Currency(code, precision, iso4217, name, currency_type)
+                currency = Currency(code, 8, 0, code, ctype)
+                
+                if hasattr(self._instrument_provider, "add_currency"):
+                    self._instrument_provider.add_currency(currency)
+                    added_count += 1
+            except Exception as e:
+                self.log.warning(f"Could not add currency {code}: {e}")
+
+        if added_count > 0:
+            self.log.info(f"Dynamically registered {added_count} currencies from Bitbank public API")
+
 

@@ -48,6 +48,10 @@ class BitbankExecutionClientFactory(LiveExecClientFactory):
                         from nautilus_trader.model import currencies
                         return getattr(currencies, code, None)
 
+                    def add_currency(self, currency):
+                        if hasattr(self._cache, "add_currency"):
+                            return self._cache.add_currency(currency)
+
                 instrument_provider = CacheWrapper(cache)
 
         return BitbankExecutionClient(loop, config, msgbus, cache, clock, instrument_provider)
