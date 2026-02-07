@@ -35,10 +35,18 @@ class BitbankExecutionClientFactory(LiveExecClientFactory):
                 # Create a wrapper that adapts Cache to InstrumentProvider
                 class CacheWrapper(InstrumentProvider):
                     def __init__(self, inner_cache):
+                        super().__init__()
                         self._cache = inner_cache
                     
                     def instrument(self, instrument_id):
                         return self._cache.instrument(instrument_id)
+
+                    def currency(self, code):
+                        if hasattr(self._cache, "currency"):
+                            return self._cache.currency(code)
+                        # Fallback to model constants if cache doesn't have it
+                        from nautilus_trader.model import currencies
+                        return getattr(currencies, code, None)
 
                 instrument_provider = CacheWrapper(cache)
 

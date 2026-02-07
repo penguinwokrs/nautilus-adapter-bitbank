@@ -12,7 +12,7 @@ from nautilus_trader.model.events import AccountState
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import JPY
 from nautilus_trader.model.identifiers import Venue, ClientId, AccountId, VenueOrderId
-from nautilus_trader.model.enums import OrderSide, OrderType, OmsType, AccountType
+from nautilus_trader.model.enums import OrderSide, OrderType, OmsType, AccountType, OrderStatus
 from nautilus_trader.execution.messages import SubmitOrder, CancelOrder
 
 from .config import BitbankExecClientConfig
@@ -56,19 +56,18 @@ class BitbankExecutionClient(LiveExecutionClient):
             self.config.proxy_url
         )
         self._rust_client.set_order_callback(self._handle_pubnub_message)
+        self.log = logging.getLogger("nautilus.bitbank.execution")
 
     @property
     def account_id(self) -> AccountId:
         return self._account_id
 
     async def _connect(self):
-        self._logger.info("BitbankExecutionClient connecting...")
-        
         if self.config.use_pubnub:
             try:
                 # Delegate Auth and Connect to Rust
                 await self._rust_client.connect()
-                self._logger.info("PubNub stream started via Rust client")
+                self.log.info("PubNub stream started via Rust client")
                 
                 # Initial Account State Fetch
                 try:
@@ -76,15 +75,15 @@ class BitbankExecutionClient(LiveExecutionClient):
                     if reports:
                         for report in reports:
                             self._send_account_state(report)
-                        self._logger.info(f"Published {len(reports)} account reports")
+                        self.log.info(f"Published {len(reports)} account reports")
                 except Exception as e:
-                    self._logger.error(f"Failed to fetch initial account state: {e}")
+                    self.log.error(f"Failed to fetch initial account state: {e}")
 
             except Exception as e:
-                self._logger.error(f"Failed to connect PubNub via Rust: {e}")
+                self.log.error(f"Failed to connect PubNub via Rust: {e}")
 
     async def _disconnect(self):
-        self._logger.info("BitbankExecutionClient disconnected")
+        self.log.info("BitbankExecutionClient disconnected")
         # TODO: Implement disconnect in Rust if needed to stop PubNub loop cleanly
         # self._rust_client.disconnect(self.loop)
 
@@ -164,40 +163,103 @@ class BitbankExecutionClient(LiveExecutionClient):
 
     def _handle_pubnub_message(self, event_type: str, message: str):
         """
-        Callback from Rust.
-        Args:
-            event_type: str (e.g. "OrderUpdate")
-            message: str (JSON payload)
+        Handle incoming PubNub message from Rust client.
         """
+        self.log.debug(f"PubNub Event Received: {event_type}")
         try:
+            data = json.loads(message)
             if event_type == "OrderUpdate":
-                data = json.loads(message).get("data")
-                if not data:
-                    return
-                
                 venue_order_id = VenueOrderId(str(data.get("order_id")))
                 pair = data.get("pair")
-                
-                # Trigger processing with the data we got from Rust
+                # Trigger processing
                 self.create_task(self._process_order_update_from_data(venue_order_id, pair, data))
+            elif event_type == "TradeUpdate":
+                # data is trade object: {"pair": "btc_jpy", "order_id": ..., "side": ..., "price": ..., "amount": ..., "fee_amount_base": ..., "fee_amount_quote": ..., "executed_at": ...}
+                self.log.info(f"Received TradeUpdate via PubNub: {data}")
+                venue_order_id = VenueOrderId(str(data.get("order_id")))
+                pair = data.get("pair")
+                self.create_task(self._process_order_update_from_data(venue_order_id, pair, data))
+            elif event_type == "AssetUpdate":
+                # data is a single asset update object
+                self._process_asset_update(data)
             else:
-                self._logger.debug(f"Unknown PubNub Event: {event_type} - {message}")
+                self.log.debug(f"Unknown PubNub Event: {event_type} - {message}")
         except Exception as e:
-            self._logger.error(f"Error handling PubNub message: {e}")
+            self.log.error(f"Error handling PubNub message: {e}")
+
+    def _process_asset_update(self, data: dict):
+        """
+        Process single asset update and generate AccountState.
+        """
+        try:
+            asset_code = data.get("asset", "").upper()
+            if not asset_code:
+                return
+
+            from nautilus_trader.model.objects import AccountBalance, Money
+
+            # Dynamic currency resolution via instrument_provider
+            currency = None
+            if hasattr(self._instrument_provider, 'currency'):
+                currency = self._instrument_provider.currency(asset_code)
+            
+            # Fallback to model constants if provider doesn't have it
+            if currency is None:
+                from nautilus_trader.model import currencies
+                currency = getattr(currencies, asset_code, None)
+            
+            if currency is None:
+                self.log.debug(f"Skipping unknown currency: {asset_code}")
+                return
+
+            total_val = int(Decimal(data.get("onhand_amount", "0")))
+            locked_val = int(Decimal(data.get("locked_amount", "0")))
+            free_val = total_val - locked_val 
+            
+            balance = AccountBalance(
+                Money(total_val, currency),
+                Money(locked_val, currency),
+                Money(free_val, currency),
+            )
+
+            import time
+            ts_now = int(time.time() * 1_000_000_000)  # Current time in nanoseconds
+            
+            account_state = AccountState(
+                self._account_id,
+                AccountType.CASH,  # bitbank is spot exchange
+                None,              # No single base currency
+                True,              # Is reported
+                [balance],         # balances list
+                [],                # margins (empty for spot)
+                {},                # info dict
+                UUID4(),           # event_id
+                ts_now,            # ts_event
+                ts_now,            # ts_init
+            )
+            self._send_account_state(account_state)
+            self.log.info(f"Updated account state for {asset_code} via PubNub")
+        except Exception as e:
+            self.log.error(f"Failed to process asset update: {e}")
 
     async def _process_order_update_from_data(self, venue_order_id: VenueOrderId, pair: str, data: dict):
-        # Find the order in cache
-        client_oid = self._cache.client_order_id(venue_order_id)
+        # Retry logic for ClientOrderId lookup (handling race condition where PubNub arrives before REST return)
+        client_oid = None
+        for _ in range(10):
+            client_oid = self._cache.client_order_id(venue_order_id)
+            if client_oid:
+                break
+            await asyncio.sleep(0.1)
+
         if not client_oid:
-            # We might not have it yet if PubNub is faster than our submit acknowledgement
-            self._logger.warning(f"ClientOrderId not found for venue_order_id: {venue_order_id}")
+            self._logger.warning(f"ClientOrderId not found for venue_order_id: {venue_order_id} after retries. Ignoring update.")
             return
-            
+
         order = self._cache.order(client_oid)
         if not order:
             self._logger.warning(f"Order not found in cache for client_order_id: {client_oid}")
             return
-            
+
         # Instrument to get quote currency for commission Money object
         instrument = self._instrument_provider.find(order.instrument_id)
         if instrument is None and hasattr(self, '_cache'):
@@ -209,19 +271,25 @@ class BitbankExecutionClient(LiveExecutionClient):
 
     async def _process_order_update(self, order: Order, venue_order_id: VenueOrderId, pair: str, quote_currency, data: dict = None) -> bool:
         """
-        Check order status and generate fill events if needed.
-        Returns True if order is closed (FILLED/CANCELED).
+        Check order status and generate events.
         """
         try:
             if data is None:
+                # Fallback to REST polling if no data provided
                 resp_json = await self._rust_client.get_order(pair, str(venue_order_id))
                 data = json.loads(resp_json)
             
             status = data.get("status")
+            executed_qty = Decimal(data.get("executed_amount", "0"))
             
-            # Check executed amount
-            executed = Decimal(data.get("executed_amount", "0"))
-            
+            # 1. Handle OrderAccepted (UNFILLED)
+            # If we received an update (even UNFILLED), it means the venue knows about it.
+            # Note: valid only if order is not yet accepted? 
+            # Nautilus deduplicates events usually, but good to be explicit.
+            if status == "UNFILLED":
+                pass 
+
+            # 2. Handle Fills
             oid_str = str(venue_order_id)
             if oid_str not in self._order_states:
                 self._order_states[oid_str] = {
@@ -232,50 +300,54 @@ class BitbankExecutionClient(LiveExecutionClient):
             state = self._order_states[oid_str]
             last_qty = state["last_executed_qty"]
             
-            if executed > last_qty:
-                delta = executed - last_qty
+            if executed_qty > last_qty:
+                delta = executed_qty - last_qty
                 
-                # Fetch trades to find price/commission
-                # Ideally we match trade ID, but for now using average price from order or trade history
-                # This is simplified.
+                # Default values from payload
                 avg_price = Decimal(data.get("average_price", "0") or "0")
-                
-                # Fetch trades for precise fill info
-                history_json = await self._rust_client.get_trade_history(pair, str(venue_order_id))
-                history = json.loads(history_json)
-                
                 commission = Money(Decimal("0"), quote_currency)
-                avg_price = Decimal(data.get("average_price", "0") or "0") # Fallback
                 
-                # Check for new trades
-                raw_trades = history.get("trades", [])
-                new_trades = []
-                for t in raw_trades:
-                    tid = str(t.get("trade_id"))
-                    if tid not in state["reported_trades"]:
-                        new_trades.append(t)
-                        state["reported_trades"].add(tid)
-                        
-                if new_trades:
-                    # Calculate weighted price and comms from new trades?
-                    # Or just use avg_price from order and sum comms?
-                    total_fee = Decimal("0")
-                    for t in new_trades:
-                        fee = Decimal(t.get("fee_amount_quote", "0"))
-                        total_fee += fee
-                        # Could calculate px here
+                # Fetch detailed trade history for accurate Fee and Price
+                try:
+                    history_json = await self._rust_client.get_trade_history(pair, str(venue_order_id))
+                    history = json.loads(history_json)
+                    raw_trades = history.get("trades", [])
                     
-                    commission = Money(total_fee, quote_currency)
-                    if len(new_trades) == 1:
-                        avg_price = Decimal(new_trades[0].get("price", "0"))
-                
+                    new_trades = []
+                    for t in raw_trades:
+                        tid = str(t.get("trade_id"))
+                        if tid not in state["reported_trades"]:
+                            new_trades.append(t)
+                            state["reported_trades"].add(tid)
+                    
+                    if new_trades:
+                        total_fee = Decimal("0")
+                        weighted_price_sum = Decimal("0")
+                        total_trade_qty = Decimal("0")
+                        
+                        for t in new_trades:
+                            qty = Decimal(t.get("amount", "0"))
+                            px = Decimal(t.get("price", "0"))
+                            fee = Decimal(t.get("fee_amount_quote", "0"))
+                            
+                            weighted_price_sum += qty * px
+                            total_trade_qty += qty
+                            total_fee += fee
+                        
+                        commission = Money(total_fee, quote_currency)
+                        if total_trade_qty > 0:
+                            avg_price = weighted_price_sum / total_trade_qty
+                            
+                except Exception as e:
+                     self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Using fallback values.")
+
                 self.generate_order_filled(
                     strategy_id=order.strategy_id,
                     instrument_id=order.instrument_id,
                     client_order_id=order.client_order_id,
                     venue_order_id=venue_order_id,
                     venue_position_id=None,
-                    fill_id=None, # generate one?
+                    fill_id=None, 
                     last_qty=delta,
                     last_px=avg_price,
                     liquidity=None,
@@ -283,11 +355,24 @@ class BitbankExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns()
                 )
                 
-                state["last_executed_qty"] = executed
+                state["last_executed_qty"] = executed_qty
 
-            if status in ("FILLED", "CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED"):
+            # 3. Handle Cancel/Close
+            if status in ("CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED"):
+                # Avoid duplicate cancel events if already processed via REST or previous update
+                if order.status not in (OrderStatus.CANCELED, OrderStatus.FILLED, OrderStatus.EXPIRED):
+                    self.generate_order_canceled(
+                        strategy_id=order.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=venue_order_id,
+                        ts_event=self._clock.timestamp_ns(),
+                    )
                 return True
                 
+            if status == "FILLED":
+                return True
+
         except Exception as e:
             self._logger.error(f"Update processing failed: {e}")
             
@@ -306,7 +391,7 @@ class BitbankExecutionClient(LiveExecutionClient):
             
             # 1. Fetch assets via Rust
             assets_json = await self._rust_client.get_assets_py()
-            print(f"!!! DEBUG_ASSETS !!!: {assets_json}")
+            self.log.debug(f"Fetched assets: {assets_json[:200]}...")  # Log first 200 chars only
             
             assets_data = json.loads(assets_json).get("assets", [])
             
@@ -314,56 +399,65 @@ class BitbankExecutionClient(LiveExecutionClient):
             for asset in assets_data:
                 currency_str = asset["asset"].upper()
                 try:
-                    currency = Currency.from_str(currency_str)
+                    # Dynamic currency resolution
+                    currency = None
+                    if hasattr(self._instrument_provider, 'currency'):
+                        currency = self._instrument_provider.currency(currency_str)
+                    if currency is None:
+                        from nautilus_trader.model import currencies
+                        currency = getattr(currencies, currency_str, None)
                     
-                    total = Decimal(asset["onhand_amount"])
-                    locked = Decimal(asset["locked_amount"])
+                    if currency is None:
+                        continue  # Skip unknown currencies
+                    
+                    total = int(Decimal(asset["onhand_amount"]))
+                    locked = int(Decimal(asset["locked_amount"]))
                     free = total - locked
                     
                     nautilus_balances.append(
                         AccountBalance(
-                            total=Money(total, currency),
-                            locked=Money(locked, currency),
-                            free=Money(free, currency),
+                            Money(total, currency),
+                            Money(locked, currency),
+                            Money(free, currency),
                         )
                     )
-                    print(f"!!! DEBUG_BALANCE !!!: {currency} Total={total} Locked={locked}")
+
                 except Exception as e:
-                    print(f"!!! DEBUG_PARSE_ERROR !!!: {currency_str} {e}")
+                    self._logger.error(f"Failed to parse balance for {currency_str}: {e}")
                     continue
             
             # Create AccountState
             # If nautilus_balances is empty, we must provide at least one balance (AccountState requires it)
             if not nautilus_balances:
-                print("!!! DEBUG: No balances found, adding zero JPY balance")
+                self.log.warning("No balances found, adding zero JPY balance")
                 nautilus_balances.append(
                     AccountBalance(
-                        total=Money(0, JPY),
-                        locked=Money(0, JPY),
-                        free=Money(0, JPY),
+                        Money(0, JPY),
+                        Money(0, JPY),
+                        Money(0, JPY),
                     )
                 )
 
+
             account_state = AccountState(
-                account_id=self._account_id,
-                account_type=self.account_type,
-                base_currency=None, # Multi-currency
-                reported=True,
-                balances=nautilus_balances,
-                margins=[], 
-                info={},
-                event_id=UUID4(),
-                ts_event=self._clock.timestamp_ns(),
-                ts_init=self._clock.timestamp_ns(),
+                self._account_id,
+                self.account_type,
+                None,  # Multi-currency
+                True,
+                nautilus_balances,
+                [],
+                {},
+                UUID4(),
+                self._clock.timestamp_ns(),
+                self._clock.timestamp_ns(),
             )
+
             reports.append(account_state)
             
             return reports
             
         except Exception as e:
-            print(f"!!! DEBUG: Failed to generate account status reports: {e}")
-            import traceback
-            traceback.print_exc()
+            self._logger.error(f"Failed to generate account status reports: {e}", exc_info=True)
             return []
 
     async def generate_fill_reports(self, instrument_id=None, client_order_id=None):

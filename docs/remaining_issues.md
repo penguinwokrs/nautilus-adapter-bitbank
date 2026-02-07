@@ -1,47 +1,41 @@
 # 残課題の整理 (Remaining Issues) - Nautilus Bitbank Adapter
 
 ## 1. 概要 (Overview)
-Rust-Firstアーキテクチャへの移行の第二段階および、接続の堅牢性（指数バックオフ）とエラーハンドリングの強化が完了しました。
+Nautilus Trader 1.222.0 仕様への完全適合、PubNub を活用した約定・資産情報のリアルタイム同期、およびコードのクリーンアップが完了しました。
 
-## 2. 解決済みの事項 (Resolved)
-- **Rust Coreの実装**: `BitbankDataClient`, `BitbankExecutionClient`, `PubNubClient`, `BitbankRestClient` の基本的なRust実装とPythonラッパーの統合。
-- **指数バックオフの実装**: WebSocketおよびPubNubポーリングにおいて、接続失敗時やレート制限時に1sから最大64sまでの指数バックオフを伴う再接続ロジックをRust側で実装。
-- **詳細なエラー伝播**: Rust側のエラーをPythonの特定の例外（`PyPermissionError`, `PyRuntimeError`等）にマッピングし、Bitbank固有のエラーコード（証拠金不足等）を詳細に通知するように改善。
-- **計器取得機能 (fetch_instruments)**: `BitbankDataClient.fetch_instruments()` を実装。REST経由で全ペア（現在62銘柄）を動的に取得し、Nautilusの `CurrencyPair` オブジェクトに正しくマッピング。
-- **Rust側での自動注文追跡**: 受信したPubNubメッセージをパースし、内部の `orders` マップを自動更新するように実装。
-- **板情報（Depth）の実装**: `data.py` の `_handle_depth` を実装し、`OrderBookSnapshot` を生成して Nautilus に流すように変更。
-- **コンパイル警告の解消**: `non-local impl`, `unused import`, `dead_code` 等の全警告を抑制・修正。
-- **テストの最適化**: `src/model/*.rs` に Rust ユニットテストを追加し、JSONパースの検証を高速化。
+## 2. 解決済みの事項 (Resolved) - Updated 2026-02-07
+- **Nautilus 1.222.0 への完全適合**: 
+    - `AccountState`, `AccountBalance`, `Money`, `Currency` の最新コンストラクタへの対応（10引数、位置引数のみ）。
+    - `Clock.now` 属性の非存在対応（フォールバック処理の実装）。
+- **通貨解決の一般化**: 
+    - `InstrumentProvider.currency()` を活用した動的通貨取得に移行。
+    - フォールバックとして `nautilus_trader.model.currencies` のモジュール属性を参照。
+- **TradeUpdate リアルタイム統合**: PubNub の `spot_trade` メッセージを処理し、REST を待たずに約定・受理を反映。
+- **資産更新の整合性確保**: `total - locked == free` バリデーションをパスするため、整数演算へのキャストと逆算ロジックを導入。
+- **レースコンディションの克服**: PubNub 通知が REST 応答より早く到着した際の `ClientOrderId` 検索リクエストを 10 回（1秒間）に強化。
+- **コードクリーンアップ**: 
+    - デバッグ用 `print()` 文の削除
+    - `traceback.format_exc()` の削除
+    - ログレベルの適正化 (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
 
-## 3. 次のアクション (Immediate Actions)
+## 3. 残っている課題 (Pending Issues)
 
-### A. 設定の柔軟性向上 (Config Refinement)
-- [x] **ハードコードの解消**: `execution_client.rs` にある PubNub の `sub_key` などの定数を `BitbankExecClientConfig` から動的に渡せるように変更。
-- [x] **プロキシ/タイムアウト設定**: `BitbankRestClient` における HTTP タイムアウトやプロキシ設定のサポート。
+### A. 安定性の最終確認 (Stability - Low Priority)
+- [ ] **長時間連続稼働エージング**: 24時間以上の連続接続を維持し、Rust 層での自動トークン更新が数日間問題なく動作することを確認する。
 
-### B. パフォーマンス検証 (Benchmarking)
-- [ ] **スループット比較**: 旧Python版とRust実装版での、高頻度なデータ受信時の CPU/メモリ使用率の比較。
-- [ ] **GIL解放の検証**: 板情報処理などの重いパース時に GIL が適切に解放され、複数学柄の並列処理が改善されているかの確認。
+### B. 追加機能 (Optional - Future)
+- [ ] **Backtest 互換性**: ヒストリカルデータの REST 取得プラグインの実装（現在は LIVE/PAPER のみ想定）。
+- [ ] **全銘柄の通貨登録**: ビットバンクの全 60+ 銘柄に対応するため、初期化時に通貨を InstrumentProvider に動的登録するロジックの追加。
 
-### C. 高度な最適化 (Advanced Optimizations)
-- [x] **Rust オブジェクト直渡し**: パース済みのオブジェクトを Python に渡すことでスループットを **100倍以上 (約6.5M msgs/sec)** に向上。
-- [x] **Rust 側での OrderBook 管理**: スナップショット (`depth_whole`) と差分更新 (`depth_diff`) を Rust 側で管理し、Python 側には最新の板状態（Top-N）を通知する実装を完了。
+---
+## 4. 検証済みフロー (Validated)
+- [x] 初期接続 (REST 銘柄・資産取得)
+- [x] リアルタイムティッカー受信 (Rust WebSocket)
+- [x] 注文発行 → Accepted (PubNub経由)
+- [x] 資産更新 (PubNub → AccountState → Portfolio)
+- [x] 注文キャンセル → Canceled (PubNub経由)
+- [x] 拘束解除の反映 (locked=0)
 
-### D. ドキュメントと運用 (DevOps)
-- [x] **開発者ガイド**: `maturin` を用いたビルド手順、テスト手順、ベンチマーク方法を `docs/developer_guide.md` に集約。
-- [x] **README 更新**: 最新の構成と性能指標を反映。
-
-## 4. 検証状況 (Verification Status)
-- [x] `cargo test`: すべての Rust テストがパス（6 tests passed）。
-- [x] `pytest tests/`: すべての Python テストがパス（9 tests passed）。
-- [x] 実機検証: `fetch_instruments` による全62銘柄の取得。
-- [x] Build: `maturin` によるビルドおよび `pip install` が警告なしで成功。
-- [x] **ライブスモークテスト**: 実際のBitbank APIを使用した30秒間のテストで以下を確認：
-    - `QuoteTick` (ティッカー): 正常受信 ✅
-    - `TradeTick` (約定履歴): 正常受信 ✅
-    - `OrderBookDeltas` (板情報): 正常受信 ✅
-    - PubNub 認証・接続: 成功 ✅
-
-## 5. 解決した技術的課題 (Resolved Technical Issues)
-- **PubNub 認証パラメータ不一致**: Bitbank API は `pubnub_channel` と `pubnub_token` を返すが、従来は `pubnub_auth_key` / `pubnub_uuid` / `pubnub_channels` を想定していた。`src/model/pubnub.rs` を修正して解決。
-- **`/v1/spot/pairs` 認証要求**: エンドポイントは Private API ドメインにあるため、認証ヘッダーが必要だった。`rest.rs` の `get_pairs` を `private=true` に変更して解決。
+---
+最終更新日: 2026-02-07
+作成: Antigravity AI

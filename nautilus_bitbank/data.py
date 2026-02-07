@@ -294,6 +294,12 @@ class BitbankDataClient(LiveMarketDataClient):
     async def _subscribe_order_book_snapshots(self, instrument_id):
         pass
 
+    async def _subscribe_bars(self, command):
+        self._logger.warning("Bitbank does not support real-time Bars subscription. Ignoring.")
+
+    async def _unsubscribe_bars(self, instrument_id):
+        pass
+
     async def _unsubscribe_order_book_snapshots(self, instrument_id):
         pass
 

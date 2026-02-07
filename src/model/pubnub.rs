@@ -1,10 +1,17 @@
 use serde::{Deserialize, Serialize};
 use crate::model::order::Order;
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BitbankPubNubData {
+    pub method: String,
+    pub params: Vec<serde_json::Value>,
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct PubNubMessage {
-    pub data: Order,
+    #[serde(rename = "d")]
+    pub data: BitbankPubNubData,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

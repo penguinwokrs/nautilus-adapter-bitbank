@@ -17,7 +17,7 @@ class BitbankExecClientConfig(LiveExecClientConfig):
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     use_pubnub: bool = True  # Enable/Disable real-time PubNub updates
-    pubnub_subscribe_key: str = "sub-c-e12e9174-dd60-11e6-806b-02ee2ddab7fe"
+    pubnub_subscribe_key: str = "sub-c-ecebae8e-dd60-11e6-b6b1-02ee2ddab7fe"
     timeout_ms: int = 10000
     proxy_url: Optional[str] = None
     

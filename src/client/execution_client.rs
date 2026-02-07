@@ -104,57 +104,103 @@ impl BitbankExecutionClient {
         pubnub_client.set_internal_sender(tx);
 
         let future = async move {
-             // 1. Get Auth
-             let auth_params = rest_client.get_pubnub_auth().await
-                 .map_err(PyErr::from)?;
-             
-             // 2. Start Processing Loop (Background)
+            
+            // 2. Start Processing Loop (Background)
              let orders_arc_loop = orders_arc.clone();
-             tokio::spawn(async move {
-                 while let Some(msg_json) = rx.recv().await {
-                     let mut event_type = "OrderUpdate";
-                     
-                     // Try parsing to update internal state
-                     if let Ok(msg) = serde_json::from_str::<crate::model::pubnub::PubNubMessage>(&msg_json) {
-                         let mut orders = orders_arc_loop.write().await;
-                         orders.insert(msg.data.order_id, msg.data.clone());
-                         event_type = "OrderUpdate"; // can be more specific if needed
+             let order_cb_arc_loop = order_cb_arc.clone();
+              tokio::spawn(async move {
+                  // eprintln!("RB: Starting internal order message loop");
+                  while let Some(msg_json) = rx.recv().await {
+                      // eprintln!("RB: Received message from PubNub channel: {}", msg_json);
+                       // Try parsing to update internal state
+                       match serde_json::from_str::<crate::model::pubnub::PubNubMessage>(&msg_json) {
+                           Ok(msg) => {
+                               let method = &msg.data.method;
+                               let event_type = match method.as_str() {
+                                   "spot_order_new" | "spot_order" => "OrderUpdate",
+                                   "spot_trade" => "TradeUpdate",
+                                   "asset_update" => "AssetUpdate",
+                                   _ => method.as_str(),
+                               };
+
+                               for param in msg.data.params {
+                                   // For OrderUpdate, try to update internal cache if it matches Order structure
+                                   if event_type == "OrderUpdate" {
+                                       if let Ok(order_data) = serde_json::from_value::<crate::model::order::Order>(param.clone()) {
+                                            let mut orders = orders_arc_loop.write().await;
+                                            orders.insert(order_data.order_id, order_data);
+                                       }
+                                   }
+
+                                   let cb_opt = {
+                                      let lock = order_cb_arc.lock().unwrap();
+                                      lock.clone()
+                                   };
+                                   
+                                   if let Some(cb) = cb_opt {
+                                       let param_json = param.to_string();
+                                       Python::with_gil(|py| {
+                                           let _ = cb.call1(py, (event_type, param_json));
+                                       });
+                                   }
+                               }
+                           },
+                           Err(e) => {
+                               eprintln!("RB: Failed to parse PubNub message internally: {}. JSON: {}", e, msg_json);
+                               // Fallback: Notify Python with raw message if internal parse fails
+                               let cb_opt = {
+                                  let lock = order_cb_arc.lock().unwrap();
+                                  lock.clone()
+                               };
+                               if let Some(cb) = cb_opt {
+                                   Python::with_gil(|py| {
+                                       let _ = cb.call1(py, ("Unknown", msg_json));
+                                   });
+                               }
+                           }
+                       }
+                  }
+                  eprintln!("RB: Internal Order Loop Terminated");
+              });
+
+             // 3. Connect PubNub (Background loop with token refresh)
+         let pc = pubnub_client.clone();
+         let rc = rest_client.clone();
+         let sub_key_loop = sub_key.clone();
+         
+         tokio::spawn(async move {
+             loop {
+                 // 1. Fetch Fresh Auth (Dynamic Token)
+                 match rc.get_pubnub_auth().await {
+                     Ok(auth_params) => {
+                         let channel = auth_params.pubnub_channel.clone();
+                         let token = auth_params.pubnub_token.clone();
+                         
+                         // 2. Connect. Returns Ok(()) on clean stop, Err on Auth error
+                         if let Err(e) = pc.connect(sub_key_loop.clone(), channel, token).await {
+                             eprintln!("RB: PubNub connection triggered refresh: {}. Re-fetching token in 5s...", e);
+                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                         } else {
+                             // Normal stop signaled by client
+                             break;
+                         }
                      }
-                     
-                     let cb_opt = {
-                        let lock = order_cb_arc.lock().unwrap();
-                        lock.clone()
-                     };
-                     
-                     if let Some(cb) = cb_opt {
-                         Python::with_gil(|py| {
-                             let _ = cb.call1(py, (event_type, msg_json));
-                         });
+                     Err(e) => {
+                         eprintln!("RB: Failed to fetch PubNub Auth for refresh: {}. Retrying in 10s...", e);
+                         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                      }
                  }
-                 println!("RB: Order Loop Terminated");
-             });
-
-             // 3. Connect PubNub (This blocks until stopped, need to spawn it too? No, pubnub.connect already loops)
-             // Wait, PubNubClient::connect LOOPS.
-             // If I await it here, this future will never complete "Connected".
-             // The previous logic awaited it?
-             // No, previously I just ran it.
-             // Wait, if `pubnub_client.connect` loops, I must SPAWN it.
-             let pc = pubnub_client.clone();
-             let channel = auth_params.pubnub_channel.clone();
-             
-             tokio::spawn(async move {
-                 let _ = pc.connect(sub_key, channel).await;
-             });
-             
-             Ok("Connected")
-        };
-        pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
-    }
+             }
+             eprintln!("RB: PubNub background loop terminated");
+         });
+         
+         Ok("Connected")
+    };
+    pyo3_asyncio::tokio::future_into_py(py, future).map(|f| f.into())
+}
 
     // Legacy manual connect if needed, or remove
-    pub fn connect_pubnub_manual(&self, py: Python, sub_key: String, channel: String) -> PyResult<PyObject> {
-        self.pubnub_client.connect_py(py, sub_key, channel)
+    pub fn connect_pubnub_manual(&self, py: Python, sub_key: String, channel: String, auth_key: String) -> PyResult<PyObject> {
+        self.pubnub_client.connect_py(py, sub_key, channel, auth_key)
     }
 }
