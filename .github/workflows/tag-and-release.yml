@@ -1,0 +1,81 @@
+name: Tag and Release on Merge
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - main
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    # CIが成功したときのみ実行
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    permissions:
+      contents: write  # タグのpushに必要
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get next version tag
+        id: version
+        run: |
+          # Get latest tag matching v*
+          LATEST=$(git tag -l "v*" | sort -V | tail -1)
+          if [ -z "$LATEST" ]; then
+            # No tags yet, use base version from pyproject.toml
+            BASE=$(grep '^version' pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+            NEW_TAG="v${BASE}"
+          else
+            # Parse version and increment patch
+            if [[ $LATEST =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+              MAJOR="${BASH_REMATCH[1]}"
+              MINOR="${BASH_REMATCH[2]}"
+              PATCH="${BASH_REMATCH[3]}"
+              NEW_PATCH=$((PATCH + 1))
+              NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+            else
+              # Fallback: append build number
+              NEW_TAG="${LATEST}.${GITHUB_RUN_NUMBER}"
+            fi
+          fi
+          # Skip if HEAD is already tagged (avoid duplicate on re-run)
+          if git describe --exact-match --tags HEAD 2>/dev/null; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${NEW_TAG}" >> $GITHUB_OUTPUT
+            # version without 'v' prefix for pyproject.toml / Cargo.toml
+            NEW_VERSION="${NEW_TAG#v}"
+            echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update version in pyproject.toml and Cargo.toml
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i 's/^version = ".*"/version = "'"${VERSION}"'"/' pyproject.toml
+          sed -i 's/^version = ".*"/version = "'"${VERSION}"'"/' Cargo.toml
+
+      - name: Commit and push version update
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml Cargo.toml
+          git diff --staged --quiet || git commit -m "chore: bump version to ${{ steps.version.outputs.version }}"
+          git push origin HEAD:main
+
+      - name: Create and push tag
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
