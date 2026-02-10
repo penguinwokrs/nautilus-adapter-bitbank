@@ -171,20 +171,22 @@ class BitbankExecutionClient(LiveExecutionClient):
         self.log.debug(f"PubNub Event Received: {event_type}")
         try:
             data = json.loads(message)
+            # Handle nested {"data": {...}} structure from Bitbank API
+            payload = data.get("data", data)
             if event_type == "OrderUpdate":
-                venue_order_id = VenueOrderId(str(data.get("order_id")))
-                pair = data.get("pair")
+                venue_order_id = VenueOrderId(str(payload.get("order_id")))
+                pair = payload.get("pair")
                 # Trigger processing
-                self.create_task(self._process_order_update_from_data(venue_order_id, pair, data))
+                self.create_task(self._process_order_update_from_data(venue_order_id, pair, payload))
             elif event_type == "TradeUpdate":
                 # data is trade object: {"pair": "btc_jpy", "order_id": ..., "side": ..., "price": ..., "amount": ..., "fee_amount_base": ..., "fee_amount_quote": ..., "executed_at": ...}
-                self.log.info(f"Received TradeUpdate via PubNub: {data}")
-                venue_order_id = VenueOrderId(str(data.get("order_id")))
-                pair = data.get("pair")
-                self.create_task(self._process_order_update_from_data(venue_order_id, pair, data))
+                self.log.info(f"Received TradeUpdate via PubNub: {payload}")
+                venue_order_id = VenueOrderId(str(payload.get("order_id")))
+                pair = payload.get("pair")
+                self.create_task(self._process_order_update_from_data(venue_order_id, pair, payload))
             elif event_type == "AssetUpdate":
                 # data is a single asset update object
-                self._process_asset_update(data)
+                self._process_asset_update(payload)
             else:
                 self.log.debug(f"Unknown PubNub Event: {event_type} - {message}")
         except Exception as e:
