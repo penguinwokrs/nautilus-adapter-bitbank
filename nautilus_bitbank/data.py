@@ -52,7 +52,7 @@ class BitbankDataClient(LiveMarketDataClient):
 
     async def _connect(self):
         self._logger.info("BitbankDataClient connected")
-        
+
         # Load instruments first
         await self._load_instruments()
 
@@ -60,6 +60,29 @@ class BitbankDataClient(LiveMarketDataClient):
             # Delegate connection to Rust (PubNub)
             await self._rust_client.connect()
             self._logger.info("Connected to Bitbank via Rust client (PubNub)")
+
+            # Auto-subscribe loaded instruments so data flows immediately
+            instruments = []
+            has_provider = self.config.instrument_provider is not None
+            has_load_ids = has_provider and bool(getattr(self.config.instrument_provider, 'load_ids', None))
+
+            if has_load_ids:
+                from nautilus_trader.model.identifiers import InstrumentId
+                for instrument_id_str in self.config.instrument_provider.load_ids:
+                    iid = InstrumentId.from_str(
+                        instrument_id_str if "." in instrument_id_str else f"{instrument_id_str}.BITBANK"
+                    )
+                    inst = self._instrument_provider.find(iid)
+                    if inst is None and self._cache:
+                        inst = self._cache.instrument(iid)
+                    if inst:
+                        instruments.append(inst)
+
+            if instruments:
+                await self.subscribe(instruments)
+                self._logger.info(f"Auto-subscribed {len(instruments)} instruments on connect")
+            else:
+                self._logger.warning("No instruments found for auto-subscribe")
         else:
             self._logger.info("PubNub disabled. Using REST polling (not implemented yet)")
             # TODO: Implement REST polling loop here if needed
@@ -136,7 +159,8 @@ class BitbankDataClient(LiveMarketDataClient):
                 ts_event=ts,
                 ts_init=self._clock.timestamp_ns(),
             )
-            self._handle_data(quote)
+            # PubNub callback runs on Rust background thread — dispatch via event loop
+            self._loop.call_soon_threadsafe(self._handle_data, quote)
 
     def _handle_transactions(self, pair: str, data: dict):
         instrument = self._subscribed_instruments.get(pair)
@@ -148,27 +172,39 @@ class BitbankDataClient(LiveMarketDataClient):
         from nautilus_trader.model.enums import AggressorSide
         from nautilus_trader.model.identifiers import TradeId
 
+        # PubNub callback runs on Rust background thread.
+        # Bypass DataEngine queue and dispatch directly to msgbus + cache
+        # to ensure INTERNAL bar aggregation receives TradeTick correctly.
+        def _dispatch_trade(client, t):
+            client._cache.add_trade_tick(t)
+            topic = f"data.trades.{t.instrument_id.venue}.{t.instrument_id.symbol}"
+            client._msgbus.publish(topic, t)
+
         # Transactions object has transactions list
         txs = data.transactions
         for tx in txs:
-            # tx: Transaction object attributes: transaction_id, price, amount, executed_at, side
-            price = tx.price
-            amount = tx.amount
-            side_str = tx.side
-            ts = int(tx.executed_at) * 1_000_000
-            
-            aggressor_side = AggressorSide.BUYER if side_str == "buy" else AggressorSide.SELLER
+            try:
+                # tx: Transaction object attributes: transaction_id, price, amount, executed_at, side
+                price = tx.price
+                amount = tx.amount
+                side_str = tx.side
+                ts = int(tx.executed_at) * 1_000_000
 
-            tick = TradeTick(
-                instrument_id=instrument.id,
-                price=Price.from_str(str(price)),
-                size=Quantity.from_str(str(amount)),
-                aggressor_side=aggressor_side,
-                trade_id=TradeId(str(tx.transaction_id)),
-                ts_event=ts,
-                ts_init=self._clock.timestamp_ns(),
-            )
-            self._handle_data(tick)
+                aggressor_side = AggressorSide.BUYER if side_str == "buy" else AggressorSide.SELLER
+
+                tick = TradeTick(
+                    instrument_id=instrument.id,
+                    price=Price.from_str(str(price)),
+                    size=Quantity.from_str(str(amount)),
+                    aggressor_side=aggressor_side,
+                    trade_id=TradeId(str(tx.transaction_id)),
+                    ts_event=ts,
+                    ts_init=self._clock.timestamp_ns(),
+                )
+
+                self._loop.call_soon_threadsafe(_dispatch_trade, self, tick)
+            except Exception as e:
+                self._logger.error(f"Error in _handle_transactions: {e}")
 
     def _handle_depth(self, pair: str, data):
         instrument = self._subscribed_instruments.get(pair)
@@ -266,13 +302,20 @@ class BitbankDataClient(LiveMarketDataClient):
     async def _subscribe_trade_ticks(self, command):
         instrument_id = command.instrument_id if hasattr(command, 'instrument_id') else command
         instrument = self._instrument_provider.find(instrument_id)
-        if instrument is None and hasattr(self, '_cache'):
+        if instrument is None and self._cache:
             instrument = self._cache.instrument(instrument_id)
 
         if instrument:
-            await self.subscribe([instrument])
+            pair = instrument.id.symbol.value.replace("/", "_").lower()
+            if pair not in self._subscribed_instruments:
+                self._subscribed_instruments[pair] = instrument
+                rooms = [f"transactions_{pair}"]
+                self._logger.info(f"_subscribe_trade_ticks: subscribing to {rooms}")
+                await self._rust_client.subscribe(rooms)
+            else:
+                self._logger.info(f"_subscribe_trade_ticks: {pair} already subscribed")
         else:
-            self._logger.error(f"Could not find instrument {instrument_id} in provider or cache")
+            self._logger.error(f"Could not find instrument {instrument_id} for trade tick subscription")
 
     async def _unsubscribe_trade_ticks(self, instrument_id):
         pass
@@ -363,7 +406,7 @@ class BitbankDataClient(LiveMarketDataClient):
                 self._logger.error(f"Failed to add manual instrument {symbol_str}: {e}")
 
         # Try fetching from API
-        url = "https://public.bitbank.cc/bitbankcc/pairs"
+        url = "https://api.bitbank.cc/v1/spot/pairs"
         data = None
         try:
             async with aiohttp.ClientSession() as session:
