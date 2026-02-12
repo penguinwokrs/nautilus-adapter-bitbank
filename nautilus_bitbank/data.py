@@ -172,6 +172,14 @@ class BitbankDataClient(LiveMarketDataClient):
         from nautilus_trader.model.enums import AggressorSide
         from nautilus_trader.model.identifiers import TradeId
 
+        # PubNub callback runs on Rust background thread.
+        # Bypass DataEngine queue and dispatch directly to msgbus + cache
+        # to ensure INTERNAL bar aggregation receives TradeTick correctly.
+        def _dispatch_trade(client, t):
+            client._cache.add_trade_tick(t)
+            topic = f"data.trades.{t.instrument_id.venue}.{t.instrument_id.symbol}"
+            client._msgbus.publish(topic, t)
+
         # Transactions object has transactions list
         txs = data.transactions
         for tx in txs:
@@ -194,13 +202,6 @@ class BitbankDataClient(LiveMarketDataClient):
                     ts_init=self._clock.timestamp_ns(),
                 )
 
-                # PubNub callback runs on Rust background thread.
-                # Bypass DataEngine queue and dispatch directly to msgbus + cache
-                # to ensure INTERNAL bar aggregation receives TradeTick correctly.
-                def _dispatch_trade(client, t):
-                    client._cache.add_trade_tick(t)
-                    topic = f"data.trades.{t.instrument_id.venue}.{t.instrument_id.symbol}"
-                    client._msgbus.publish(topic, t)
                 self._loop.call_soon_threadsafe(_dispatch_trade, self, tick)
             except Exception as e:
                 self._logger.error(f"Error in _handle_transactions: {e}")

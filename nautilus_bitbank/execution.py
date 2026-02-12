@@ -321,6 +321,7 @@ class BitbankExecutionClient(LiveExecutionClient):
                 avg_price = Decimal(data.get("average_price", "0") or "0")
                 commission = Money(Decimal("0"), quote_currency)
                 trade_id_str = str(uuid.uuid4())
+                liquidity_side = LiquiditySide.MAKER
 
                 # Fetch detailed trade history for accurate Fee and Price
                 try:
@@ -339,6 +340,10 @@ class BitbankExecutionClient(LiveExecutionClient):
                         total_fee = Decimal("0")
                         weighted_price_sum = Decimal("0")
                         total_trade_qty = Decimal("0")
+
+                        # Determine liquidity from the first new trade
+                        maker_taker = new_trades[0].get("maker_taker", "maker")
+                        liquidity_side = LiquiditySide.TAKER if maker_taker == "taker" else LiquiditySide.MAKER
 
                         for t in new_trades:
                             qty = Decimal(t.get("amount", "0"))
@@ -370,7 +375,7 @@ class BitbankExecutionClient(LiveExecutionClient):
                     last_px=Price.from_str(str(avg_price)),
                     quote_currency=quote_currency,
                     commission=commission,
-                    liquidity_side=LiquiditySide.MAKER,
+                    liquidity_side=liquidity_side,
                     ts_event=self._clock.timestamp_ns(),
                 )
 
