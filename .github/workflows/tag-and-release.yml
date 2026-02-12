@@ -14,7 +14,7 @@ jobs:
     # CIが成功したときのみ実行
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     permissions:
-      contents: write  # タグのpushに必要
+      contents: write  # タグのpush + リリース作成に必要
       actions: write  # CIトリガーに必要
     steps:
       - name: Checkout
@@ -80,6 +80,32 @@ jobs:
           git push origin "${{ steps.version.outputs.tag }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build wheel directly here — GITHUB_TOKEN tag pushes don't trigger
+      # the separate release.yml workflow, so we build inline.
+      - name: Setup Python
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheels
+        if: steps.version.outputs.skip != 'true'
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: --release --out dist
+          manylinux: auto
+
+      - name: Upload wheel to GitHub Release
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            dist/*.whl \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # WorkflowからのpushはCIをトリガーしないため、明示的にCIを実行
       - name: Trigger CI for version bump commit

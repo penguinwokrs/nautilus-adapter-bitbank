@@ -1,5 +1,7 @@
 name: Release
 
+# Fallback: triggered by manual tag pushes (not automated ones).
+# The tag-and-release.yml workflow handles automated releases with wheel builds.
 on:
   push:
     tags:
@@ -37,7 +39,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
-      - name: Create Release
+      - name: Create or update Release
         uses: softprops/action-gh-release@v2
         with:
           files: wheels-*/*
