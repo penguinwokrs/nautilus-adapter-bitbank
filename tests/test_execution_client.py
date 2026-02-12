@@ -3,12 +3,12 @@ import asyncio
 import json
 from decimal import Decimal
 from unittest.mock import MagicMock, AsyncMock, ANY
-from nautilus_trader.model.identifiers import Venue, InstrumentId, ClientOrderId, VenueOrderId, StrategyId
+from nautilus_trader.model.identifiers import Venue, InstrumentId, ClientOrderId, VenueOrderId, StrategyId, TradeId
 
 from nautilus_trader.model.identifiers import Venue, InstrumentId, ClientOrderId, VenueOrderId
 from nautilus_trader.model.objects import Money, Currency, Quantity, Price
 from nautilus_trader.model.orders import LimitOrder
-from nautilus_trader.model.enums import OrderType, OrderSide, TimeInForce
+from nautilus_trader.model.enums import OrderType, OrderSide, TimeInForce, LiquiditySide
 from nautilus_trader.execution.messages import SubmitOrder, CancelOrder
 
 @pytest.fixture
@@ -154,6 +154,11 @@ async def test_process_order_update_fill(exec_client, test_order):
     assert kwargs["last_qty"] == Decimal("0.005")
     assert kwargs["last_px"] == Decimal("3000000")
     assert kwargs["commission"] == Money.from_str("100 JPY")
+    assert kwargs["trade_id"] == TradeId("9991")
+    assert kwargs["order_side"] == OrderSide.BUY
+    assert kwargs["order_type"] == OrderType.LIMIT
+    assert kwargs["quote_currency"] == Currency.from_str("JPY")
+    assert kwargs["liquidity_side"] == LiquiditySide.MAKER
 
 @pytest.mark.asyncio
 async def test_handle_pubnub_message_trigger(exec_client, test_order):

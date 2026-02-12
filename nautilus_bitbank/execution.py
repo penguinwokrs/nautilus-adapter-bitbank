@@ -11,8 +11,8 @@ from nautilus_trader.model.objects import Money, Currency, AccountBalance
 from nautilus_trader.model.events import AccountState
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import JPY
-from nautilus_trader.model.identifiers import Venue, ClientId, AccountId, VenueOrderId
-from nautilus_trader.model.enums import OrderSide, OrderType, OmsType, AccountType, OrderStatus
+from nautilus_trader.model.identifiers import Venue, ClientId, AccountId, VenueOrderId, TradeId
+from nautilus_trader.model.enums import OrderSide, OrderType, OmsType, AccountType, OrderStatus, LiquiditySide
 from nautilus_trader.execution.messages import SubmitOrder, CancelOrder
 
 from .config import BitbankExecClientConfig
@@ -311,6 +311,7 @@ class BitbankExecutionClient(LiveExecutionClient):
                 commission = Money(Decimal("0"), quote_currency)
                 
                 # Fetch detailed trade history for accurate Fee and Price
+                new_trades = []
                 try:
                     history_json = await self._rust_client.get_trade_history(pair, str(venue_order_id))
                     history = json.loads(history_json)
@@ -344,18 +345,27 @@ class BitbankExecutionClient(LiveExecutionClient):
                 except Exception as e:
                      self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Using fallback values.")
 
+                # Determine trade_id from trade history or generate fallback
+                if new_trades:
+                    trade_id = TradeId(str(new_trades[0].get("trade_id")))
+                else:
+                    trade_id = TradeId(str(venue_order_id) + "-" + str(int(delta * 10**8)))
+
                 self.generate_order_filled(
                     strategy_id=order.strategy_id,
                     instrument_id=order.instrument_id,
                     client_order_id=order.client_order_id,
                     venue_order_id=venue_order_id,
                     venue_position_id=None,
-                    fill_id=None, 
+                    trade_id=trade_id,
+                    order_side=order.side,
+                    order_type=order.order_type,
                     last_qty=delta,
                     last_px=avg_price,
-                    liquidity=None,
+                    quote_currency=quote_currency,
                     commission=commission,
-                    ts_event=self._clock.timestamp_ns()
+                    liquidity_side=LiquiditySide.MAKER,
+                    ts_event=self._clock.timestamp_ns(),
                 )
                 
                 state["last_executed_qty"] = executed_qty
