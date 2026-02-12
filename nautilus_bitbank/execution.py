@@ -324,12 +324,12 @@ class BitbankExecutionClient(LiveExecutionClient):
                 liquidity_side = LiquiditySide.MAKER
 
                 # Fetch detailed trade history for accurate Fee and Price
+                new_trades = []
                 try:
                     history_json = await self._rust_client.get_trade_history(pair, str(venue_order_id))
                     history = json.loads(history_json)
                     raw_trades = history.get("trades", [])
 
-                    new_trades = []
                     for t in raw_trades:
                         tid = str(t.get("trade_id"))
                         if tid not in state["reported_trades"]:
