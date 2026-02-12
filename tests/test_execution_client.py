@@ -151,14 +151,105 @@ async def test_process_order_update_fill(exec_client, test_order):
     assert is_closed is False
     exec_client.generate_order_filled.assert_called_once()
     kwargs = exec_client.generate_order_filled.call_args[1]
-    assert kwargs["last_qty"] == Decimal("0.005")
-    assert kwargs["last_px"] == Decimal("3000000")
+    assert kwargs["last_qty"] == Quantity.from_str("0.005")
+    assert kwargs["last_px"] == Price.from_str("3000000")
     assert kwargs["commission"] == Money.from_str("100 JPY")
     assert kwargs["trade_id"] == TradeId("9991")
     assert kwargs["order_side"] == OrderSide.BUY
     assert kwargs["order_type"] == OrderType.LIMIT
     assert kwargs["quote_currency"] == Currency.from_str("JPY")
     assert kwargs["liquidity_side"] == LiquiditySide.MAKER
+
+@pytest.mark.asyncio
+async def test_process_order_update_fill_taker(exec_client, test_order):
+    """Test that liquidity_side is TAKER when maker_taker='taker'."""
+    mock_rust = exec_client._rust_client
+    venue_order_id = VenueOrderId("123456790")
+    exec_client._active_orders[str(venue_order_id)] = test_order
+    exec_client._order_states[str(venue_order_id)] = {
+        "last_executed_qty": Decimal("0"),
+        "reported_trades": set()
+    }
+
+    quote_currency = Currency.from_str("JPY")
+
+    mock_rust.get_order.return_value = json.dumps({
+        "order_id": 123456790,
+        "status": "PARTIALLY_FILLED",
+        "executed_amount": "0.003",
+        "average_price": "2900000"
+    })
+
+    mock_rust.get_trade_history.return_value = json.dumps({
+        "trades": [
+            {
+                "trade_id": 8881,
+                "pair": "btc_jpy",
+                "order_id": 123456790,
+                "side": "buy",
+                "type": "limit",
+                "amount": "0.003",
+                "price": "2900000",
+                "maker_taker": "taker",
+                "fee_amount_quote": "50",
+                "executed_at": 1600000002000
+            }
+        ]
+    })
+
+    exec_client.generate_order_filled = MagicMock()
+
+    await exec_client._process_order_update(
+        test_order, venue_order_id, "btc_jpy", quote_currency
+    )
+
+    exec_client.generate_order_filled.assert_called_once()
+    kwargs = exec_client.generate_order_filled.call_args[1]
+    assert kwargs["trade_id"] == TradeId("8881")
+    assert kwargs["liquidity_side"] == LiquiditySide.TAKER
+    assert kwargs["commission"] == Money.from_str("50 JPY")
+
+@pytest.mark.asyncio
+async def test_process_order_update_fill_no_trade_history(exec_client, test_order):
+    """Test fallback trade_id when trade history fetch fails."""
+    mock_rust = exec_client._rust_client
+    venue_order_id = VenueOrderId("123456791")
+    exec_client._active_orders[str(venue_order_id)] = test_order
+    exec_client._order_states[str(venue_order_id)] = {
+        "last_executed_qty": Decimal("0"),
+        "reported_trades": set()
+    }
+
+    quote_currency = Currency.from_str("JPY")
+
+    # Trade history fetch raises exception
+    mock_rust.get_trade_history.side_effect = Exception("API timeout")
+
+    exec_client.generate_order_filled = MagicMock()
+
+    data = {
+        "order_id": 123456791,
+        "status": "PARTIALLY_FILLED",
+        "executed_amount": "0.002",
+        "average_price": "3100000"
+    }
+
+    await exec_client._process_order_update(
+        test_order, venue_order_id, "btc_jpy", quote_currency, data
+    )
+
+    exec_client.generate_order_filled.assert_called_once()
+    kwargs = exec_client.generate_order_filled.call_args[1]
+    # Fallback: trade_id should be a UUID (not from trade history)
+    assert kwargs["trade_id"] is not None
+    trade_id_str = str(kwargs["trade_id"])
+    assert len(trade_id_str) > 0
+    # Fallback uses default liquidity_side = MAKER
+    assert kwargs["liquidity_side"] == LiquiditySide.MAKER
+    # Fallback uses avg_price from payload
+    assert kwargs["last_px"] == Price.from_str("3100000")
+    # Fallback uses zero commission
+    assert kwargs["commission"] == Money.from_str("0 JPY")
 
 @pytest.mark.asyncio
 async def test_handle_pubnub_message_trigger(exec_client, test_order):
