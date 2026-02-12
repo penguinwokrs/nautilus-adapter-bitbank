@@ -107,7 +107,6 @@ impl BitbankExecutionClient {
             
             // 2. Start Processing Loop (Background)
              let orders_arc_loop = orders_arc.clone();
-             let order_cb_arc_loop = order_cb_arc.clone();
               tokio::spawn(async move {
                   // eprintln!("RB: Starting internal order message loop");
                   while let Some(msg_json) = rx.recv().await {

@@ -1,13 +1,14 @@
 import asyncio
 import json
 import logging
+import uuid
 from typing import Dict, List, Optional
 from decimal import Decimal
 
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.orders import Order
-from nautilus_trader.model.objects import Money, Currency, AccountBalance
+from nautilus_trader.model.objects import Money, Currency, AccountBalance, Price, Quantity
 from nautilus_trader.model.events import AccountState
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import JPY
@@ -27,6 +28,11 @@ class BitbankExecutionClient(LiveExecutionClient):
     Rust-First implementation wrapper.
     Actual logic resides in bitbank.BitbankExecutionClient (Rust).
     """
+    # API rate limit guard: serialize all API calls with 300ms delay
+    # to prevent Bitbank Error 20001 (concurrent requests)
+    _api_lock = asyncio.Lock()
+    _API_DELAY_SEC = 0.3
+
     def __init__(self, loop, config: BitbankExecClientConfig, msgbus, cache, clock, instrument_provider: InstrumentProvider):
         super().__init__(
             loop=loop,
@@ -94,75 +100,81 @@ class BitbankExecutionClient(LiveExecutionClient):
         self.create_task(self._submit_order(command))
 
     async def _submit_order(self, command: SubmitOrder) -> None:
-        try:
-            order = command.order
-            instrument_id = order.instrument_id
-            pair = instrument_id.symbol.value.replace("/", "_").lower()
-            
-            side = "buy" if order.side == OrderSide.BUY else "sell"
-            
-            order_type = "market"
-            price = None
-            if order.order_type == OrderType.LIMIT:
-                order_type = "limit"
-                price = str(order.price)
-            elif order.order_type != OrderType.MARKET:
-                # Reject unsupported
-                return
+        async with self._api_lock:
+            try:
+                order = command.order
+                instrument_id = order.instrument_id
+                pair = instrument_id.symbol.value.replace("/", "_").lower()
 
-            amount = str(order.quantity)
-            
-            client_id = str(order.client_order_id)
-            resp_json = await self._rust_client.submit_order(
-                pair,
-                amount,
-                side,
-                order_type,
-                client_id,
-                price
-            )
-            
-            resp = json.loads(resp_json)
-            venue_order_id = VenueOrderId(str(resp.get("order_id")))
-            
-            self.generate_order_accepted(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                venue_order_id=venue_order_id,
-                ts_event=self._clock.timestamp_ns(),
-            )
-            
-        except Exception as e:
-            self._logger.error(f"Submit failed: {e}")
-            # Generate rejected event...
+                side = "buy" if order.side == OrderSide.BUY else "sell"
+
+                order_type = "market"
+                price = None
+                if order.order_type == OrderType.LIMIT:
+                    order_type = "limit"
+                    price = str(order.price)
+                elif order.order_type != OrderType.MARKET:
+                    # Reject unsupported
+                    return
+
+                amount = str(order.quantity)
+
+                client_id = str(order.client_order_id)
+                resp_json = await self._rust_client.submit_order(
+                    pair,
+                    amount,
+                    side,
+                    order_type,
+                    client_id,
+                    price
+                )
+
+                resp = json.loads(resp_json)
+                venue_order_id = VenueOrderId(str(resp.get("order_id")))
+
+                self.generate_order_accepted(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=venue_order_id,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+
+            except Exception as e:
+                self._logger.error(f"Submit failed: {e}")
+                # Generate rejected event...
+
+            await asyncio.sleep(self._API_DELAY_SEC)
 
     def cancel_order(self, command: CancelOrder) -> None:
         self.create_task(self._cancel_order(command))
 
     async def _cancel_order(self, command: CancelOrder) -> None:
-        try:
-            if not command.venue_order_id:
-                return
+        async with self._api_lock:
+            try:
+                if not command.venue_order_id:
+                    return
 
-            instrument_id = command.instrument_id
-            pair = instrument_id.symbol.value.replace("/", "_").lower()
-            
-            await self._rust_client.cancel_order(
-                pair,
-                str(command.venue_order_id)
-            )
-            
-            self.generate_order_canceled(
-                strategy_id=command.strategy_id,
-                instrument_id=command.instrument_id,
-                client_order_id=command.client_order_id,
-                venue_order_id=command.venue_order_id, # type: ignore
-                ts_event=self._clock.timestamp_ns(),
-            )
-            
-        except Exception as e:
-            self._logger.error(f"Cancel failed: {e}")
+                instrument_id = command.instrument_id
+                pair = instrument_id.symbol.value.replace("/", "_").lower()
+
+                await self._rust_client.cancel_order(
+                    pair,
+                    str(command.venue_order_id)
+                )
+
+                self.generate_order_canceled(
+                    strategy_id=command.strategy_id,
+                    instrument_id=command.instrument_id,
+                    client_order_id=command.client_order_id,
+                    venue_order_id=command.venue_order_id, # type: ignore
+                    ts_event=self._clock.timestamp_ns(),
+                )
+
+            except Exception as e:
+                self._logger.error(f"Cancel failed: {e}")
+
+            await asyncio.sleep(self._API_DELAY_SEC)
 
     def _handle_pubnub_message(self, event_type: str, message: str):
         """
@@ -171,20 +183,22 @@ class BitbankExecutionClient(LiveExecutionClient):
         self.log.debug(f"PubNub Event Received: {event_type}")
         try:
             data = json.loads(message)
+            # Handle nested {"data": {...}} structure from Bitbank API
+            payload = data.get("data", data)
             if event_type == "OrderUpdate":
-                venue_order_id = VenueOrderId(str(data.get("order_id")))
-                pair = data.get("pair")
+                venue_order_id = VenueOrderId(str(payload.get("order_id")))
+                pair = payload.get("pair")
                 # Trigger processing
-                self.create_task(self._process_order_update_from_data(venue_order_id, pair, data))
+                self.create_task(self._process_order_update_from_data(venue_order_id, pair, payload))
             elif event_type == "TradeUpdate":
                 # data is trade object: {"pair": "btc_jpy", "order_id": ..., "side": ..., "price": ..., "amount": ..., "fee_amount_base": ..., "fee_amount_quote": ..., "executed_at": ...}
-                self.log.info(f"Received TradeUpdate via PubNub: {data}")
-                venue_order_id = VenueOrderId(str(data.get("order_id")))
-                pair = data.get("pair")
-                self.create_task(self._process_order_update_from_data(venue_order_id, pair, data))
+                self.log.info(f"Received TradeUpdate via PubNub: {payload}")
+                venue_order_id = VenueOrderId(str(payload.get("order_id")))
+                pair = payload.get("pair")
+                self.create_task(self._process_order_update_from_data(venue_order_id, pair, payload))
             elif event_type == "AssetUpdate":
                 # data is a single asset update object
-                self._process_asset_update(data)
+                self._process_asset_update(payload)
             else:
                 self.log.debug(f"Unknown PubNub Event: {event_type} - {message}")
         except Exception as e:
@@ -281,16 +295,13 @@ class BitbankExecutionClient(LiveExecutionClient):
                 # Fallback to REST polling if no data provided
                 resp_json = await self._rust_client.get_order(pair, str(venue_order_id))
                 data = json.loads(resp_json)
-            
+
             status = data.get("status")
             executed_qty = Decimal(data.get("executed_amount", "0"))
-            
+
             # 1. Handle OrderAccepted (UNFILLED)
-            # If we received an update (even UNFILLED), it means the venue knows about it.
-            # Note: valid only if order is not yet accepted? 
-            # Nautilus deduplicates events usually, but good to be explicit.
             if status == "UNFILLED":
-                pass 
+                pass
 
             # 2. Handle Fills
             oid_str = str(venue_order_id)
@@ -299,57 +310,57 @@ class BitbankExecutionClient(LiveExecutionClient):
                     "last_executed_qty": Decimal("0"),
                     "reported_trades": set()
                 }
-            
+
             state = self._order_states[oid_str]
             last_qty = state["last_executed_qty"]
-            
+
             if executed_qty > last_qty:
                 delta = executed_qty - last_qty
-                
+
                 # Default values from payload
                 avg_price = Decimal(data.get("average_price", "0") or "0")
                 commission = Money(Decimal("0"), quote_currency)
-                
+                trade_id_str = str(uuid.uuid4())
+                liquidity_side = LiquiditySide.MAKER
+
                 # Fetch detailed trade history for accurate Fee and Price
                 new_trades = []
                 try:
                     history_json = await self._rust_client.get_trade_history(pair, str(venue_order_id))
                     history = json.loads(history_json)
                     raw_trades = history.get("trades", [])
-                    
-                    new_trades = []
+
                     for t in raw_trades:
                         tid = str(t.get("trade_id"))
                         if tid not in state["reported_trades"]:
                             new_trades.append(t)
                             state["reported_trades"].add(tid)
-                    
+
                     if new_trades:
                         total_fee = Decimal("0")
                         weighted_price_sum = Decimal("0")
                         total_trade_qty = Decimal("0")
-                        
+
+                        # Determine liquidity from the first new trade
+                        maker_taker = new_trades[0].get("maker_taker", "maker")
+                        liquidity_side = LiquiditySide.TAKER if maker_taker == "taker" else LiquiditySide.MAKER
+
                         for t in new_trades:
                             qty = Decimal(t.get("amount", "0"))
                             px = Decimal(t.get("price", "0"))
                             fee = Decimal(t.get("fee_amount_quote", "0"))
-                            
+
                             weighted_price_sum += qty * px
                             total_trade_qty += qty
                             total_fee += fee
-                        
+
                         commission = Money(total_fee, quote_currency)
                         if total_trade_qty > 0:
                             avg_price = weighted_price_sum / total_trade_qty
-                            
-                except Exception as e:
-                     self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Using fallback values.")
+                        trade_id_str = str(new_trades[0].get("trade_id", trade_id_str))
 
-                # Determine trade_id from trade history or generate fallback
-                if new_trades:
-                    trade_id = TradeId(str(new_trades[0].get("trade_id")))
-                else:
-                    trade_id = TradeId(str(venue_order_id) + "-" + str(int(delta * 10**8)))
+                except Exception as e:
+                    self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Using fallback values.")
 
                 self.generate_order_filled(
                     strategy_id=order.strategy_id,
@@ -357,17 +368,17 @@ class BitbankExecutionClient(LiveExecutionClient):
                     client_order_id=order.client_order_id,
                     venue_order_id=venue_order_id,
                     venue_position_id=None,
-                    trade_id=trade_id,
+                    trade_id=TradeId(trade_id_str),
                     order_side=order.side,
                     order_type=order.order_type,
-                    last_qty=delta,
-                    last_px=avg_price,
+                    last_qty=Quantity.from_str(str(delta)),
+                    last_px=Price.from_str(str(avg_price)),
                     quote_currency=quote_currency,
                     commission=commission,
-                    liquidity_side=LiquiditySide.MAKER,
+                    liquidity_side=liquidity_side,
                     ts_event=self._clock.timestamp_ns(),
                 )
-                
+
                 state["last_executed_qty"] = executed_qty
 
             # 3. Handle Cancel/Close
@@ -382,13 +393,15 @@ class BitbankExecutionClient(LiveExecutionClient):
                         ts_event=self._clock.timestamp_ns(),
                     )
                 return True
-                
+
             if status == "FILLED":
                 return True
 
         except Exception as e:
             self._logger.error(f"Update processing failed: {e}")
-            
+            import traceback
+            self._logger.error(traceback.format_exc())
+
         return False
 
     # Required abstract methods

@@ -1,6 +1,6 @@
 [package]
 name = "nautilus-bitbank"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 
 [lib]
@@ -10,12 +10,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pyo3 = { version = "0.20", features = ["extension-module", "abi3-py311"] }
 pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
-tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 futures-util = "0.3"
 url = "2.4"
 chrono = { version = "0.4", features = ["serde"] }
