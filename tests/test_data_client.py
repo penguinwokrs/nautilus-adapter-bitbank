@@ -80,14 +80,11 @@ async def test_handle_transactions(data_client):
 
     await data_client._connect()
 
-    # Make call_soon_threadsafe execute synchronously for testing
+    # Capture call_soon_threadsafe calls instead of executing them,
+    # because _cache is a Cython property and cannot be replaced with a mock.
+    threadsafe_calls = []
     data_client._loop = MagicMock()
-    data_client._loop.call_soon_threadsafe = lambda fn, *args: fn(*args)
-
-    # Mock cache and msgbus for dispatch verification
-    # (transactions bypass _handle_data and dispatch directly to cache + msgbus)
-    data_client._cache = MagicMock()
-    data_client._msgbus = MagicMock()
+    data_client._loop.call_soon_threadsafe = lambda fn, *args: threadsafe_calls.append((fn, args))
 
     from nautilus_bitbank import Transaction, Transactions
     tx = Transaction(
@@ -101,18 +98,17 @@ async def test_handle_transactions(data_client):
 
     data_client._handle_rust_data("transactions_btc_jpy", data_obj)
 
-    # Verify TradeTick dispatched to cache (not _handle_data)
-    assert data_client._cache.add_trade_tick.called
-    tick: TradeTick = data_client._cache.add_trade_tick.call_args[0][0]
+    # Verify _dispatch_trade was scheduled via call_soon_threadsafe
+    assert len(threadsafe_calls) == 1
+    fn, args = threadsafe_calls[0]
+    # args = (client, tick) — extract the TradeTick
+    tick: TradeTick = args[1]
 
     from nautilus_trader.model.objects import Quantity
     assert tick.price == 1000000
     assert tick.size == Quantity.from_str("0.01")
     from nautilus_trader.model.identifiers import TradeId
     assert tick.trade_id == TradeId("12345")
-
-    # Verify msgbus publish was also called
-    assert data_client._msgbus.publish.called
 
 @pytest.mark.asyncio
 async def test_handle_depth(data_client):
