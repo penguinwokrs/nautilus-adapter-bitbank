@@ -373,7 +373,8 @@ class BitbankExecutionClient(LiveExecutionClient):
                         return False
 
                 except Exception as e:
-                    self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Using fallback values.")
+                    self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Skipping fill to prevent overfill.")
+                    return False
 
                 self.generate_order_filled(
                     strategy_id=order.strategy_id,
@@ -458,6 +459,8 @@ class BitbankExecutionClient(LiveExecutionClient):
             base, quote = pair.upper().split("_")
             instrument_id = InstrumentId(Symbol(f"{base}/{quote}"), self.venue)
 
+        ordered_at_ms = order_data.get("ordered_at")
+        ts_accepted = int(ordered_at_ms * 1_000_000) if ordered_at_ms else self._clock.timestamp_ns()
         ts_now = self._clock.timestamp_ns()
 
         return OrderStatusReport(
@@ -471,9 +474,9 @@ class BitbankExecutionClient(LiveExecutionClient):
             quantity=Quantity.from_str(str(start_amount)),
             filled_qty=Quantity.from_str(str(executed_amount)),
             report_id=UUID4(),
-            ts_accepted=ts_now,
+            ts_accepted=ts_accepted,
             ts_last=ts_now,
-            ts_init=ts_now,
+            ts_init=ts_accepted,
             client_order_id=client_order_id,
             price=price,
         )
