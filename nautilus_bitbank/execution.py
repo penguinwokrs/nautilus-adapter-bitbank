@@ -12,9 +12,10 @@ from nautilus_trader.model.objects import Money, Currency, AccountBalance, Price
 from nautilus_trader.model.events import AccountState
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import JPY
-from nautilus_trader.model.identifiers import Venue, ClientId, AccountId, VenueOrderId, TradeId
-from nautilus_trader.model.enums import OrderSide, OrderType, OmsType, AccountType, OrderStatus, LiquiditySide
-from nautilus_trader.execution.messages import SubmitOrder, CancelOrder
+from nautilus_trader.model.identifiers import Venue, ClientId, AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId, TradeId
+from nautilus_trader.model.enums import OrderSide, OrderType, OmsType, AccountType, OrderStatus, TimeInForce, LiquiditySide
+from nautilus_trader.execution.messages import SubmitOrder, CancelOrder, GenerateOrderStatusReport, GenerateOrderStatusReports
+from nautilus_trader.execution.reports import OrderStatusReport
 
 from .config import BitbankExecClientConfig
 
@@ -357,10 +358,23 @@ class BitbankExecutionClient(LiveExecutionClient):
                         commission = Money(total_fee, quote_currency)
                         if total_trade_qty > 0:
                             avg_price = weighted_price_sum / total_trade_qty
+                            # Use trade history qty as delta to prevent overfill
+                            # from duplicate/stale PubNub events (fixes #11)
+                            delta = total_trade_qty
                         trade_id_str = str(new_trades[0].get("trade_id", trade_id_str))
+                    else:
+                        # No new trades found despite executed_qty increase;
+                        # likely a duplicate event - skip fill generation
+                        self._logger.debug(
+                            f"No new trades for {venue_order_id} despite executed_qty increase "
+                            f"({last_qty} -> {executed_qty}), skipping fill"
+                        )
+                        state["last_executed_qty"] = executed_qty
+                        return False
 
                 except Exception as e:
-                    self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Using fallback values.")
+                    self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Skipping fill to prevent overfill.")
+                    return False
 
                 self.generate_order_filled(
                     strategy_id=order.strategy_id,
@@ -405,6 +419,109 @@ class BitbankExecutionClient(LiveExecutionClient):
         return False
 
     # Required abstract methods
+
+    BB_ORDER_STATUS_MAP = {
+        "UNFILLED": OrderStatus.ACCEPTED,
+        "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
+        "FULLY_FILLED": OrderStatus.FILLED,
+        "CANCELED_UNFILLED": OrderStatus.CANCELED,
+        "CANCELED_PARTIALLY_FILLED": OrderStatus.CANCELED,
+    }
+    BB_ORDER_TYPE_MAP = {
+        "limit": OrderType.LIMIT,
+        "market": OrderType.MARKET,
+    }
+
+    def _parse_order_status_report(
+        self,
+        order_data: dict,
+        instrument_id: InstrumentId | None = None,
+        client_order_id: ClientOrderId | None = None,
+    ) -> OrderStatusReport:
+        venue_oid = VenueOrderId(str(order_data.get("order_id")))
+        side_str = order_data.get("side", "buy")
+        order_side = OrderSide.BUY if side_str == "buy" else OrderSide.SELL
+
+        order_type_str = order_data.get("type", "limit")
+        order_type = self.BB_ORDER_TYPE_MAP.get(order_type_str, OrderType.LIMIT)
+
+        status_str = order_data.get("status", "UNFILLED")
+        order_status = self.BB_ORDER_STATUS_MAP.get(status_str, OrderStatus.ACCEPTED)
+
+        start_amount = Decimal(order_data.get("start_amount", "0"))
+        executed_amount = Decimal(order_data.get("executed_amount", "0"))
+
+        price_str = order_data.get("price")
+        price = Price.from_str(price_str) if price_str else None
+
+        if instrument_id is None:
+            pair = order_data.get("pair", "btc_jpy")
+            base, quote = pair.upper().split("_")
+            instrument_id = InstrumentId(Symbol(f"{base}/{quote}"), self.venue)
+
+        ordered_at_ms = order_data.get("ordered_at")
+        ts_accepted = int(ordered_at_ms * 1_000_000) if ordered_at_ms else self._clock.timestamp_ns()
+        ts_now = self._clock.timestamp_ns()
+
+        return OrderStatusReport(
+            account_id=self._account_id,
+            instrument_id=instrument_id,
+            venue_order_id=venue_oid,
+            order_side=order_side,
+            order_type=order_type,
+            time_in_force=TimeInForce.GTC,
+            order_status=order_status,
+            quantity=Quantity.from_str(str(start_amount)),
+            filled_qty=Quantity.from_str(str(executed_amount)),
+            report_id=UUID4(),
+            ts_accepted=ts_accepted,
+            ts_last=ts_now,
+            ts_init=ts_accepted,
+            client_order_id=client_order_id,
+            price=price,
+        )
+
+    async def generate_order_status_report(
+        self,
+        command: GenerateOrderStatusReport,
+    ) -> OrderStatusReport | None:
+        try:
+            venue_order_id = command.venue_order_id
+            if venue_order_id is None and command.client_order_id is not None:
+                venue_order_id = self._cache.venue_order_id(command.client_order_id)
+            if venue_order_id is None:
+                self._logger.warning("generate_order_status_report: no venue_order_id available")
+                return None
+
+            # Determine pair from instrument_id or cache
+            pair = None
+            instrument_id = command.instrument_id
+            if instrument_id:
+                pair = instrument_id.symbol.value.replace("/", "_").lower()
+            else:
+                # Try to find pair from cached order
+                if command.client_order_id:
+                    cached_order = self._cache.order(command.client_order_id)
+                    if cached_order:
+                        pair = cached_order.instrument_id.symbol.value.replace("/", "_").lower()
+                        instrument_id = cached_order.instrument_id
+
+            if pair is None:
+                self._logger.warning("generate_order_status_report: cannot determine pair")
+                return None
+
+            resp_json = await self._rust_client.get_order(pair, str(venue_order_id))
+            order_data = json.loads(resp_json)
+
+            return self._parse_order_status_report(
+                order_data,
+                instrument_id=instrument_id,
+                client_order_id=command.client_order_id,
+            )
+        except Exception as e:
+            self._logger.error(f"Failed to generate order status report: {e}")
+            return None
+
     async def generate_order_status_reports(self, instrument_id=None, client_order_id=None):
         return []
 

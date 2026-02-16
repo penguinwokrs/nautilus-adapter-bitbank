@@ -211,7 +211,7 @@ async def test_process_order_update_fill_taker(exec_client, test_order):
 
 @pytest.mark.asyncio
 async def test_process_order_update_fill_no_trade_history(exec_client, test_order):
-    """Test fallback trade_id when trade history fetch fails."""
+    """Test that fill is skipped when trade history fetch fails (overfill prevention)."""
     mock_rust = exec_client._rust_client
     venue_order_id = VenueOrderId("123456791")
     exec_client._active_orders[str(venue_order_id)] = test_order
@@ -234,22 +234,13 @@ async def test_process_order_update_fill_no_trade_history(exec_client, test_orde
         "average_price": "3100000"
     }
 
-    await exec_client._process_order_update(
+    result = await exec_client._process_order_update(
         test_order, venue_order_id, "btc_jpy", quote_currency, data
     )
 
-    exec_client.generate_order_filled.assert_called_once()
-    kwargs = exec_client.generate_order_filled.call_args[1]
-    # Fallback: trade_id should be a UUID (not from trade history)
-    assert kwargs["trade_id"] is not None
-    trade_id_str = str(kwargs["trade_id"])
-    assert len(trade_id_str) > 0
-    # Fallback uses default liquidity_side = MAKER
-    assert kwargs["liquidity_side"] == LiquiditySide.MAKER
-    # Fallback uses avg_price from payload
-    assert kwargs["last_px"] == Price.from_str("3100000")
-    # Fallback uses zero commission
-    assert kwargs["commission"] == Money.from_str("0 JPY")
+    # Fill should be skipped to prevent overfill when trade history is unavailable
+    assert result is False
+    exec_client.generate_order_filled.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_handle_pubnub_message_trigger(exec_client, test_order):
