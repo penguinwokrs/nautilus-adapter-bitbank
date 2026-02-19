@@ -210,8 +210,8 @@ async def test_process_order_update_fill_taker(exec_client, test_order):
     assert kwargs["commission"] == Money.from_str("50 JPY")
 
 @pytest.mark.asyncio
-async def test_process_order_update_fill_no_trade_history(exec_client, test_order):
-    """Test that fill is skipped when trade history fetch fails (overfill prevention)."""
+async def test_process_order_update_fill_no_trade_history_fallback(exec_client, test_order):
+    """Test that fill uses average_price fallback when trade history fails (#13)."""
     mock_rust = exec_client._rust_client
     venue_order_id = VenueOrderId("123456791")
     exec_client._active_orders[str(venue_order_id)] = test_order
@@ -222,7 +222,7 @@ async def test_process_order_update_fill_no_trade_history(exec_client, test_orde
 
     quote_currency = Currency.from_str("JPY")
 
-    # Trade history fetch raises exception
+    # Trade history fetch raises exception on all retries
     mock_rust.get_trade_history.side_effect = Exception("API timeout")
 
     exec_client.generate_order_filled = MagicMock()
@@ -238,9 +238,153 @@ async def test_process_order_update_fill_no_trade_history(exec_client, test_orde
         test_order, venue_order_id, "btc_jpy", quote_currency, data
     )
 
-    # Fill should be skipped to prevent overfill when trade history is unavailable
+    # Fill should be generated using average_price fallback
+    assert result is False  # Not a terminal status
+    exec_client.generate_order_filled.assert_called_once()
+    kwargs = exec_client.generate_order_filled.call_args[1]
+    assert kwargs["last_px"] == Price.from_str("3100000")
+    assert kwargs["last_qty"] == Quantity.from_str("0.002")
+    assert kwargs["liquidity_side"] == LiquiditySide.MAKER  # default when no trade history
+
+    # State should be updated to prevent reconciliation
+    assert exec_client._order_states[str(venue_order_id)]["last_executed_qty"] == Decimal("0.002")
+
+@pytest.mark.asyncio
+async def test_process_order_update_fill_no_trade_history_price_zero(exec_client, test_order):
+    """Test that fill is rejected when trade history fails AND average_price=0 (#13)."""
+    mock_rust = exec_client._rust_client
+    venue_order_id = VenueOrderId("123456792")
+    exec_client._active_orders[str(venue_order_id)] = test_order
+    exec_client._order_states[str(venue_order_id)] = {
+        "last_executed_qty": Decimal("0"),
+        "reported_trades": set()
+    }
+
+    quote_currency = Currency.from_str("JPY")
+
+    # Trade history fetch fails
+    mock_rust.get_trade_history.side_effect = Exception("API timeout")
+
+    exec_client.generate_order_filled = MagicMock()
+
+    data = {
+        "order_id": 123456792,
+        "status": "PARTIALLY_FILLED",
+        "executed_amount": "0.002",
+        "average_price": "0"  # No average price available (e.g. race condition)
+    }
+
+    result = await exec_client._process_order_update(
+        test_order, venue_order_id, "btc_jpy", quote_currency, data
+    )
+
+    # Fill should be REJECTED (price=0) but state updated to prevent reconciliation
     assert result is False
     exec_client.generate_order_filled.assert_not_called()
+    # State must be updated to prevent ExecEngine reconciliation from generating price=0 fill
+    assert exec_client._order_states[str(venue_order_id)]["last_executed_qty"] == Decimal("0.002")
+
+@pytest.mark.asyncio
+async def test_process_order_update_trade_history_retry(exec_client, test_order):
+    """Test that trade history fetch is retried on transient failure (#13)."""
+    mock_rust = exec_client._rust_client
+    venue_order_id = VenueOrderId("123456793")
+    exec_client._active_orders[str(venue_order_id)] = test_order
+    exec_client._order_states[str(venue_order_id)] = {
+        "last_executed_qty": Decimal("0"),
+        "reported_trades": set()
+    }
+
+    quote_currency = Currency.from_str("JPY")
+
+    # First call fails, second succeeds
+    mock_rust.get_trade_history.side_effect = [
+        Exception("API timeout"),
+        json.dumps({
+            "trades": [
+                {
+                    "trade_id": 7771,
+                    "pair": "btc_jpy",
+                    "order_id": 123456793,
+                    "side": "buy",
+                    "type": "limit",
+                    "amount": "0.003",
+                    "price": "2800000",
+                    "maker_taker": "maker",
+                    "fee_amount_quote": "30",
+                    "executed_at": 1600000003000
+                }
+            ]
+        }),
+    ]
+
+    exec_client.generate_order_filled = MagicMock()
+
+    data = {
+        "order_id": 123456793,
+        "status": "PARTIALLY_FILLED",
+        "executed_amount": "0.003",
+        "average_price": "2800000"
+    }
+
+    await exec_client._process_order_update(
+        test_order, venue_order_id, "btc_jpy", quote_currency, data
+    )
+
+    # Fill should succeed after retry
+    exec_client.generate_order_filled.assert_called_once()
+    kwargs = exec_client.generate_order_filled.call_args[1]
+    assert kwargs["last_px"] == Price.from_str("2800000")
+    assert kwargs["trade_id"] == TradeId("7771")
+
+@pytest.mark.asyncio
+async def test_process_order_update_trade_history_price_zero_from_trades(exec_client, test_order):
+    """Test that fill is rejected when trade history returns price=0 (#13)."""
+    mock_rust = exec_client._rust_client
+    venue_order_id = VenueOrderId("123456794")
+    exec_client._active_orders[str(venue_order_id)] = test_order
+    exec_client._order_states[str(venue_order_id)] = {
+        "last_executed_qty": Decimal("0"),
+        "reported_trades": set()
+    }
+
+    quote_currency = Currency.from_str("JPY")
+
+    # Trade history returns trades with price=0 (Bitbank anomaly)
+    mock_rust.get_trade_history.return_value = json.dumps({
+        "trades": [
+            {
+                "trade_id": 6661,
+                "pair": "btc_jpy",
+                "order_id": 123456794,
+                "side": "buy",
+                "type": "limit",
+                "amount": "0.005",
+                "price": "0",
+                "maker_taker": "maker",
+                "fee_amount_quote": "0",
+                "executed_at": 1600000004000
+            }
+        ]
+    })
+
+    exec_client.generate_order_filled = MagicMock()
+
+    data = {
+        "order_id": 123456794,
+        "status": "PARTIALLY_FILLED",
+        "executed_amount": "0.005",
+        "average_price": "0"
+    }
+
+    result = await exec_client._process_order_update(
+        test_order, venue_order_id, "btc_jpy", quote_currency, data
+    )
+
+    # Fill should be REJECTED (price=0) and state updated
+    assert result is False
+    exec_client.generate_order_filled.assert_not_called()
+    assert exec_client._order_states[str(venue_order_id)]["last_executed_qty"] == Decimal("0.005")
 
 @pytest.mark.asyncio
 async def test_handle_pubnub_message_trigger(exec_client, test_order):
