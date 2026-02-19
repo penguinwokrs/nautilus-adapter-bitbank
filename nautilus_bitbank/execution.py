@@ -301,6 +301,9 @@ class BitbankExecutionClient(LiveExecutionClient):
             try:
                 history_json = await self._rust_client.get_trade_history(pair, venue_order_id)
                 return json.loads(history_json)
+            except json.JSONDecodeError as e:
+                self._logger.error(f"Failed to parse trade history JSON for {venue_order_id}: {e}")
+                return None
             except Exception as e:
                 last_error = e
                 if attempt < self._TRADE_HISTORY_MAX_RETRIES - 1:

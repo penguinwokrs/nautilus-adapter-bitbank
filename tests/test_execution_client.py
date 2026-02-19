@@ -387,6 +387,42 @@ async def test_process_order_update_trade_history_price_zero_from_trades(exec_cl
     assert exec_client._order_states[str(venue_order_id)]["last_executed_qty"] == Decimal("0.005")
 
 @pytest.mark.asyncio
+async def test_fetch_trade_history_json_decode_error_no_retry(exec_client, test_order):
+    """Test that JSONDecodeError is not retried (data format issue, not transient) (#13)."""
+    mock_rust = exec_client._rust_client
+    venue_order_id = VenueOrderId("123456795")
+    exec_client._active_orders[str(venue_order_id)] = test_order
+    exec_client._order_states[str(venue_order_id)] = {
+        "last_executed_qty": Decimal("0"),
+        "reported_trades": set()
+    }
+
+    quote_currency = Currency.from_str("JPY")
+
+    # Return malformed JSON — should fail immediately without retry
+    mock_rust.get_trade_history.return_value = "not valid json {{"
+
+    exec_client.generate_order_filled = MagicMock()
+
+    data = {
+        "order_id": 123456795,
+        "status": "PARTIALLY_FILLED",
+        "executed_amount": "0.003",
+        "average_price": "2800000"
+    }
+
+    await exec_client._process_order_update(
+        test_order, venue_order_id, "btc_jpy", quote_currency, data
+    )
+
+    # Should have been called exactly once (no retry for JSONDecodeError)
+    assert mock_rust.get_trade_history.call_count == 1
+    # Should fallback to average_price
+    exec_client.generate_order_filled.assert_called_once()
+    kwargs = exec_client.generate_order_filled.call_args[1]
+    assert kwargs["last_px"] == Price.from_str("2800000")
+
+@pytest.mark.asyncio
 async def test_handle_pubnub_message_trigger(exec_client, test_order):
     """Test PubNub message parsing triggering update."""
     # Mock the internal processing method to avoid cache lookups in this test
