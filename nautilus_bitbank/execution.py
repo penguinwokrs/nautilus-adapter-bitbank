@@ -287,6 +287,38 @@ class BitbankExecutionClient(LiveExecutionClient):
         
         await self._process_order_update(order, venue_order_id, pair, quote_currency, data)
 
+    # Trade history retry configuration
+    _TRADE_HISTORY_MAX_RETRIES = 3
+    _TRADE_HISTORY_RETRY_DELAY_SEC = 0.5
+
+    async def _fetch_trade_history_with_retry(self, pair: str, venue_order_id: str) -> dict | None:
+        """Fetch trade history with retry logic for transient API failures.
+
+        Returns parsed trade history dict on success, None on failure after retries.
+        """
+        last_error = None
+        for attempt in range(self._TRADE_HISTORY_MAX_RETRIES):
+            try:
+                history_json = await self._rust_client.get_trade_history(pair, venue_order_id)
+                return json.loads(history_json)
+            except json.JSONDecodeError as e:
+                self._logger.error(f"Failed to parse trade history JSON for {venue_order_id}: {e}")
+                return None
+            except Exception as e:
+                last_error = e
+                if attempt < self._TRADE_HISTORY_MAX_RETRIES - 1:
+                    delay = self._TRADE_HISTORY_RETRY_DELAY_SEC * (2 ** attempt)
+                    self._logger.warning(
+                        f"Trade history fetch attempt {attempt + 1}/{self._TRADE_HISTORY_MAX_RETRIES} "
+                        f"failed for {venue_order_id}: {e}. Retrying in {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+        self._logger.error(
+            f"Trade history fetch failed after {self._TRADE_HISTORY_MAX_RETRIES} attempts "
+            f"for {venue_order_id}: {last_error}"
+        )
+        return None
+
     async def _process_order_update(self, order: Order, venue_order_id: VenueOrderId, pair: str, quote_currency, data: dict = None) -> bool:
         """
         Check order status and generate events.
@@ -323,12 +355,13 @@ class BitbankExecutionClient(LiveExecutionClient):
                 commission = Money(Decimal("0"), quote_currency)
                 trade_id_str = str(uuid.uuid4())
                 liquidity_side = LiquiditySide.MAKER
+                used_fallback = False
 
                 # Fetch detailed trade history for accurate Fee and Price
                 new_trades = []
-                try:
-                    history_json = await self._rust_client.get_trade_history(pair, str(venue_order_id))
-                    history = json.loads(history_json)
+                history = await self._fetch_trade_history_with_retry(pair, str(venue_order_id))
+
+                if history is not None:
                     raw_trades = history.get("trades", [])
 
                     for t in raw_trades:
@@ -371,9 +404,24 @@ class BitbankExecutionClient(LiveExecutionClient):
                         )
                         state["last_executed_qty"] = executed_qty
                         return False
+                else:
+                    # Trade history unavailable after retries — fall back to
+                    # order-level average_price to prevent ExecEngine
+                    # reconciliation from generating price=0 fills (#13)
+                    used_fallback = True
+                    self._logger.warning(
+                        f"Using order average_price fallback for {venue_order_id}: "
+                        f"avg_price={avg_price}, delta={delta}"
+                    )
 
-                except Exception as e:
-                    self._logger.warning(f"Failed to fetch trade history for fill details: {e}. Skipping fill to prevent overfill.")
+                # Guard: never generate a fill with price=0 (#13)
+                if avg_price <= 0:
+                    self._logger.error(
+                        f"Rejecting fill with price=0 for {venue_order_id} "
+                        f"(executed_qty={executed_qty}, source={'fallback' if used_fallback else 'trade_history'}). "
+                        f"Updating state to prevent reconciliation."
+                    )
+                    state["last_executed_qty"] = executed_qty
                     return False
 
                 self.generate_order_filled(
