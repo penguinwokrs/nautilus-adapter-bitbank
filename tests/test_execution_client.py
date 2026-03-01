@@ -423,26 +423,11 @@ async def test_fetch_trade_history_json_decode_error_no_retry(exec_client, test_
     assert kwargs["last_px"] == Price.from_str("2800000")
 
 @pytest.mark.asyncio
-async def test_process_order_update_fill_maker_buy_fee_in_base(exec_client, test_order):
-    """Test that BUY maker fills use fee_amount_base (converted to quote currency).
-
-    On Bitbank, BUY order fees/rebates are applied in base currency (e.g., XRP).
-    fee_amount_quote is typically 0 for BUY orders.
-    The adapter must convert fee_amount_base to quote currency using trade price.
-    """
-    mock_rust = exec_client._rust_client
-    venue_order_id = VenueOrderId("123456800")
-    exec_client._active_orders[str(venue_order_id)] = test_order
-    exec_client._order_states[str(venue_order_id)] = {
-        "last_executed_qty": Decimal("0"),
-        "reported_trades": set()
-    }
-
-    quote_currency = Currency.from_str("JPY")
-
-    # BUY maker fill: fee is in base currency, fee_amount_quote is 0
-    mock_rust.get_trade_history.return_value = json.dumps({
-        "trades": [
+@pytest.mark.parametrize(
+    "venue_order_id_str, trade_data, expected_commission_str",
+    [
+        pytest.param(
+            "123456800",
             {
                 "trade_id": 5551,
                 "pair": "xrp_jpy",
@@ -454,52 +439,13 @@ async def test_process_order_update_fill_maker_buy_fee_in_base(exec_client, test
                 "maker_taker": "maker",
                 "fee_amount_base": "-0.002",
                 "fee_amount_quote": "0",
-                "executed_at": 1600000010000
-            }
-        ]
-    })
-
-    exec_client.generate_order_filled = MagicMock()
-
-    data = {
-        "order_id": 123456800,
-        "status": "PARTIALLY_FILLED",
-        "executed_amount": "10",
-        "average_price": "350"
-    }
-
-    await exec_client._process_order_update(
-        test_order, venue_order_id, "xrp_jpy", quote_currency, data
-    )
-
-    exec_client.generate_order_filled.assert_called_once()
-    kwargs = exec_client.generate_order_filled.call_args[1]
-    assert kwargs["trade_id"] == TradeId("5551")
-    assert kwargs["liquidity_side"] == LiquiditySide.MAKER
-    # fee_amount_base=-0.002 XRP * price=350 JPY = -0.7 JPY → rounds to -1 JPY
-    assert kwargs["commission"] == Money.from_str("-1 JPY")
-
-
-@pytest.mark.asyncio
-async def test_process_order_update_fill_sell_fee_in_quote(exec_client, test_order):
-    """Test that SELL maker fills correctly use fee_amount_quote.
-
-    On Bitbank, SELL order fees/rebates are applied in quote currency (JPY).
-    fee_amount_base is typically 0 for SELL orders.
-    """
-    mock_rust = exec_client._rust_client
-    venue_order_id = VenueOrderId("123456801")
-    exec_client._active_orders[str(venue_order_id)] = test_order
-    exec_client._order_states[str(venue_order_id)] = {
-        "last_executed_qty": Decimal("0"),
-        "reported_trades": set()
-    }
-
-    quote_currency = Currency.from_str("JPY")
-
-    # SELL maker fill: fee is in quote currency, fee_amount_base is 0
-    mock_rust.get_trade_history.return_value = json.dumps({
-        "trades": [
+                "executed_at": 1600000010000,
+            },
+            "-1 JPY",
+            id="buy_maker_fee_in_base",
+        ),
+        pytest.param(
+            "123456801",
             {
                 "trade_id": 5552,
                 "pair": "xrp_jpy",
@@ -511,18 +457,44 @@ async def test_process_order_update_fill_sell_fee_in_quote(exec_client, test_ord
                 "maker_taker": "maker",
                 "fee_amount_base": "0",
                 "fee_amount_quote": "-0.7",
-                "executed_at": 1600000011000
-            }
-        ]
-    })
+                "executed_at": 1600000011000,
+            },
+            "-1 JPY",
+            id="sell_maker_fee_in_quote",
+        ),
+    ],
+)
+async def test_process_order_update_fill_fee_calculation(
+    exec_client, test_order, venue_order_id_str, trade_data, expected_commission_str
+):
+    """Test commission calculation for BUY and SELL maker fills.
+
+    On Bitbank:
+    - BUY orders: fee/rebate in base currency (fee_amount_base), fee_amount_quote=0
+    - SELL orders: fee/rebate in quote currency (fee_amount_quote), fee_amount_base=0
+    The adapter must combine both fields, converting base fee via trade price.
+    """
+    mock_rust = exec_client._rust_client
+    venue_order_id = VenueOrderId(venue_order_id_str)
+    exec_client._active_orders[str(venue_order_id)] = test_order
+    exec_client._order_states[str(venue_order_id)] = {
+        "last_executed_qty": Decimal("0"),
+        "reported_trades": set(),
+    }
+
+    quote_currency = Currency.from_str("JPY")
+
+    mock_rust.get_trade_history.return_value = json.dumps(
+        {"trades": [trade_data]}
+    )
 
     exec_client.generate_order_filled = MagicMock()
 
     data = {
-        "order_id": 123456801,
+        "order_id": trade_data["order_id"],
         "status": "PARTIALLY_FILLED",
-        "executed_amount": "10",
-        "average_price": "350"
+        "executed_amount": trade_data["amount"],
+        "average_price": trade_data["price"],
     }
 
     await exec_client._process_order_update(
@@ -531,10 +503,9 @@ async def test_process_order_update_fill_sell_fee_in_quote(exec_client, test_ord
 
     exec_client.generate_order_filled.assert_called_once()
     kwargs = exec_client.generate_order_filled.call_args[1]
-    assert kwargs["trade_id"] == TradeId("5552")
+    assert kwargs["trade_id"] == TradeId(str(trade_data["trade_id"]))
     assert kwargs["liquidity_side"] == LiquiditySide.MAKER
-    # fee_amount_quote=-0.7 JPY → rounds to -1 JPY
-    assert kwargs["commission"] == Money.from_str("-1 JPY")
+    assert kwargs["commission"] == Money.from_str(expected_commission_str)
 
 
 @pytest.mark.asyncio
