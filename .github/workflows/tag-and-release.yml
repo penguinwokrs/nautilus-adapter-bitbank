@@ -95,7 +95,7 @@ jobs:
         with:
           target: x86_64
           args: --release --out dist
-          manylinux: auto
+          manylinux: manylinux_2_28
 
       - name: Upload wheel to GitHub Release
         if: steps.version.outputs.skip != 'true'
