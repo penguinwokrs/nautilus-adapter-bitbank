@@ -382,7 +382,16 @@ class BitbankExecutionClient(LiveExecutionClient):
                         for t in new_trades:
                             qty = Decimal(t.get("amount", "0"))
                             px = Decimal(t.get("price", "0"))
-                            fee = Decimal(t.get("fee_amount_quote", "0"))
+                            fee_quote = Decimal(t.get("fee_amount_quote", "0"))
+                            fee_base = Decimal(t.get("fee_amount_base", "0"))
+
+                            # Combine both fee components into quote currency.
+                            # BUY orders: fee/rebate in base currency (fee_amount_base),
+                            #   fee_amount_quote is typically 0.
+                            # SELL orders: fee/rebate in quote currency (fee_amount_quote),
+                            #   fee_amount_base is typically 0.
+                            # Convert base fee to quote currency using trade price.
+                            fee = fee_quote + (fee_base * px if px > 0 else Decimal("0"))
 
                             weighted_price_sum += qty * px
                             total_trade_qty += qty
