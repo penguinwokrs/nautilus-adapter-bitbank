@@ -535,3 +535,106 @@ async def test_handle_pubnub_message_trigger(exec_client, test_order):
     assert str(args[0]) == "123456789"
     assert args[1] == "btc_jpy"
     assert args[2]["status"] == "FILLED"
+
+
+# --- #17: _parse_order_status_report avg_px tests ---
+
+def test_parse_order_status_report_limit_filled_uses_price_as_avg_px(exec_client):
+    """Test that filled LIMIT order uses order price as avg_px (#17)."""
+    order_data = {
+        "order_id": 55239834019,
+        "pair": "xrp_jpy",
+        "side": "sell",
+        "type": "limit",
+        "status": "FULLY_FILLED",
+        "start_amount": "2.3431",
+        "executed_amount": "2.3431",
+        "price": "220.200",
+        "ordered_at": 1772476077691,
+    }
+
+    report = exec_client._parse_order_status_report(order_data)
+
+    assert report.avg_px is not None
+    assert float(report.avg_px) == 220.200
+
+
+def test_parse_order_status_report_limit_filled_with_average_price(exec_client):
+    """Test that average_price from API is preferred over order price (#17)."""
+    order_data = {
+        "order_id": 55239834020,
+        "pair": "xrp_jpy",
+        "side": "buy",
+        "type": "limit",
+        "status": "FULLY_FILLED",
+        "start_amount": "10",
+        "executed_amount": "10",
+        "price": "220.000",
+        "average_price": "219.950",
+        "ordered_at": 1772476077691,
+    }
+
+    report = exec_client._parse_order_status_report(order_data)
+
+    assert report.avg_px is not None
+    assert float(report.avg_px) == 219.950
+
+
+def test_parse_order_status_report_unfilled_has_no_avg_px(exec_client):
+    """Test that unfilled orders do not set avg_px (#17)."""
+    order_data = {
+        "order_id": 55239834021,
+        "pair": "xrp_jpy",
+        "side": "buy",
+        "type": "limit",
+        "status": "UNFILLED",
+        "start_amount": "5",
+        "executed_amount": "0",
+        "price": "215.000",
+        "ordered_at": 1772476077691,
+    }
+
+    report = exec_client._parse_order_status_report(order_data)
+
+    assert report.avg_px is None
+
+
+def test_parse_order_status_report_market_filled_with_average_price(exec_client):
+    """Test that MARKET order uses average_price as avg_px (#17)."""
+    order_data = {
+        "order_id": 55239834022,
+        "pair": "xrp_jpy",
+        "side": "buy",
+        "type": "market",
+        "status": "FULLY_FILLED",
+        "start_amount": "3",
+        "executed_amount": "3",
+        "average_price": "221.500",
+        "ordered_at": 1772476077691,
+    }
+
+    report = exec_client._parse_order_status_report(order_data)
+
+    assert report.avg_px is not None
+    assert float(report.avg_px) == 221.500
+
+
+def test_parse_order_status_report_zero_average_price_falls_back_to_limit(exec_client):
+    """Test that avg_px=0 from API falls back to LIMIT price (#17)."""
+    order_data = {
+        "order_id": 55239834023,
+        "pair": "xrp_jpy",
+        "side": "sell",
+        "type": "limit",
+        "status": "FULLY_FILLED",
+        "start_amount": "1",
+        "executed_amount": "1",
+        "price": "220.100",
+        "average_price": "0",
+        "ordered_at": 1772476077691,
+    }
+
+    report = exec_client._parse_order_status_report(order_data)
+
+    assert report.avg_px is not None
+    assert float(report.avg_px) == 220.100
