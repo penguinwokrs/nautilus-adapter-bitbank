@@ -513,14 +513,14 @@ class BitbankExecutionClient(LiveExecutionClient):
 
         # #17: Set avg_px for filled orders to prevent ExecEngine
         # reconciliation from generating inferred fills with price=0.
-        # LIMIT orders: use order price (= exact fill price).
-        # MARKET orders: use average_price from API response.
+        # For filled orders, prefer `average_price` from the API response.
+        # If unavailable/zero, fall back to the order `price` (for LIMIT orders).
         avg_px = None
         if executed_amount > 0:
             avg_price_str = order_data.get("average_price")
             if avg_price_str and Decimal(avg_price_str) > 0:
                 avg_px = Price.from_str(avg_price_str)
-            elif price is not None and float(price) > 0:
+            elif price is not None and price > 0:
                 avg_px = price
 
         if instrument_id is None:
