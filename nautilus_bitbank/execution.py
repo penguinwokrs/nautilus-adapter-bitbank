@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import Dict, List, Optional
 from decimal import Decimal
@@ -18,6 +19,7 @@ from nautilus_trader.execution.messages import SubmitOrder, CancelOrder, Generat
 from nautilus_trader.execution.reports import OrderStatusReport
 
 from .config import BitbankExecClientConfig
+from .constants import RETRYABLE_ERROR_CODES
 
 try:
     from . import _nautilus_bitbank as bitbank
@@ -33,6 +35,19 @@ class BitbankExecutionClient(LiveExecutionClient):
     # to prevent Bitbank Error 20001 (concurrent requests)
     _api_lock = asyncio.Lock()
     _API_DELAY_SEC = 0.3
+
+    # Submit order retry configuration
+    _SUBMIT_MAX_RETRIES = 3
+    _SUBMIT_RETRY_BASE_DELAY_SEC = 1.0
+
+    # Regex to extract 5-digit error code from Rust error messages
+    # Matches both "Bitbank Error (60011): ..." and "Insufficient Funds (60001): ..."
+    _BITBANK_ERROR_CODE_RE = re.compile(r"\((\d{5})\)")
+
+    @staticmethod
+    def _extract_error_code(exc: Exception) -> int | None:
+        match = BitbankExecutionClient._BITBANK_ERROR_CODE_RE.search(str(exc))
+        return int(match.group(1)) if match else None
 
     def __init__(self, loop, config: BitbankExecClientConfig, msgbus, cache, clock, instrument_provider: InstrumentProvider):
         super().__init__(
@@ -101,51 +116,73 @@ class BitbankExecutionClient(LiveExecutionClient):
         self.create_task(self._submit_order(command))
 
     async def _submit_order(self, command: SubmitOrder) -> None:
-        async with self._api_lock:
-            try:
-                order = command.order
-                instrument_id = order.instrument_id
-                pair = instrument_id.symbol.value.replace("/", "_").lower()
+        order = command.order
+        instrument_id = order.instrument_id
+        pair = instrument_id.symbol.value.replace("/", "_").lower()
+        side = "buy" if order.side == OrderSide.BUY else "sell"
 
-                side = "buy" if order.side == OrderSide.BUY else "sell"
+        order_type = "market"
+        price = None
+        if order.order_type == OrderType.LIMIT:
+            order_type = "limit"
+            price = str(order.price)
+        elif order.order_type != OrderType.MARKET:
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=order.client_order_id,
+                reason=f"Unsupported order type: {order.order_type}",
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
 
-                order_type = "market"
-                price = None
-                if order.order_type == OrderType.LIMIT:
-                    order_type = "limit"
-                    price = str(order.price)
-                elif order.order_type != OrderType.MARKET:
-                    # Reject unsupported
-                    return
+        amount = str(order.quantity)
+        client_id = str(order.client_order_id)
+        last_error = None
 
-                amount = str(order.quantity)
+        for attempt in range(self._SUBMIT_MAX_RETRIES):
+            async with self._api_lock:
+                try:
+                    resp_json = await self._rust_client.submit_order(
+                        pair, amount, side, order_type, client_id, price,
+                    )
+                    resp = json.loads(resp_json)
+                    venue_order_id = VenueOrderId(str(resp.get("order_id")))
+                    self.generate_order_accepted(
+                        strategy_id=order.strategy_id,
+                        instrument_id=instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=venue_order_id,
+                        ts_event=self._clock.timestamp_ns(),
+                    )
+                    return  # success
+                except Exception as e:
+                    last_error = e
+                finally:
+                    await asyncio.sleep(self._API_DELAY_SEC)
 
-                client_id = str(order.client_order_id)
-                resp_json = await self._rust_client.submit_order(
-                    pair,
-                    amount,
-                    side,
-                    order_type,
-                    client_id,
-                    price
+            # Retry decision (outside lock so other API calls aren't blocked)
+            code = self._extract_error_code(last_error)
+            if code not in RETRYABLE_ERROR_CODES:
+                break  # non-retryable → reject immediately
+
+            if attempt < self._SUBMIT_MAX_RETRIES - 1:
+                delay = self._SUBMIT_RETRY_BASE_DELAY_SEC * (2 ** attempt)
+                self._logger.warning(
+                    "Submit attempt %d/%d failed (code=%s): %s. Retry in %.1fs",
+                    attempt + 1, self._SUBMIT_MAX_RETRIES, code, last_error, delay,
                 )
+                await asyncio.sleep(delay)
 
-                resp = json.loads(resp_json)
-                venue_order_id = VenueOrderId(str(resp.get("order_id")))
-
-                self.generate_order_accepted(
-                    strategy_id=order.strategy_id,
-                    instrument_id=order.instrument_id,
-                    client_order_id=order.client_order_id,
-                    venue_order_id=venue_order_id,
-                    ts_event=self._clock.timestamp_ns(),
-                )
-
-            except Exception as e:
-                self._logger.error(f"Submit failed: {e}")
-                # Generate rejected event...
-
-            await asyncio.sleep(self._API_DELAY_SEC)
+        # All retries exhausted → reject
+        self._logger.error("Submit rejected after %d attempts: %s", self._SUBMIT_MAX_RETRIES, last_error)
+        self.generate_order_rejected(
+            strategy_id=order.strategy_id,
+            instrument_id=instrument_id,
+            client_order_id=order.client_order_id,
+            reason=str(last_error),
+            ts_event=self._clock.timestamp_ns(),
+        )
 
     def cancel_order(self, command: CancelOrder) -> None:
         self.create_task(self._cancel_order(command))
@@ -155,26 +192,25 @@ class BitbankExecutionClient(LiveExecutionClient):
             try:
                 if not command.venue_order_id:
                     return
-
-                instrument_id = command.instrument_id
-                pair = instrument_id.symbol.value.replace("/", "_").lower()
-
-                await self._rust_client.cancel_order(
-                    pair,
-                    str(command.venue_order_id)
-                )
-
+                pair = command.instrument_id.symbol.value.replace("/", "_").lower()
+                await self._rust_client.cancel_order(pair, str(command.venue_order_id))
                 self.generate_order_canceled(
                     strategy_id=command.strategy_id,
                     instrument_id=command.instrument_id,
                     client_order_id=command.client_order_id,
-                    venue_order_id=command.venue_order_id, # type: ignore
+                    venue_order_id=command.venue_order_id,
                     ts_event=self._clock.timestamp_ns(),
                 )
-
             except Exception as e:
-                self._logger.error(f"Cancel failed: {e}")
-
+                self._logger.error("Cancel failed: %s", e)
+                self.generate_order_cancel_rejected(
+                    strategy_id=command.strategy_id,
+                    instrument_id=command.instrument_id,
+                    client_order_id=command.client_order_id,
+                    venue_order_id=command.venue_order_id,
+                    reason=str(e),
+                    ts_event=self._clock.timestamp_ns(),
+                )
             await asyncio.sleep(self._API_DELAY_SEC)
 
     def _handle_pubnub_message(self, event_type: str, message: str):

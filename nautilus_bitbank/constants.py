@@ -103,4 +103,12 @@ ERROR_CODES = {
     60001: "Insufficient funds",
     60003: "Exceed maximum amount",
     60004: "Exceed maximum order value",
+    60011: "Exceed maximum number of orders",
+}
+
+# Error codes that are transient and safe to retry
+RETRYABLE_ERROR_CODES: set[int] = {
+    60011,  # Exceed maximum number of orders (concurrent order limit)
+    10001,  # Rate limit exceeded
+    10007,  # Timed out
 }

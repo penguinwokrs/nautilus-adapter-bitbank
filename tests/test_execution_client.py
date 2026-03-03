@@ -2,7 +2,7 @@ import pytest
 import asyncio
 import json
 from decimal import Decimal
-from unittest.mock import MagicMock, AsyncMock, ANY
+from unittest.mock import MagicMock, AsyncMock, ANY, patch
 from nautilus_trader.model.identifiers import Venue, InstrumentId, ClientOrderId, VenueOrderId, StrategyId, TradeId
 
 from nautilus_trader.model.identifiers import Venue, InstrumentId, ClientOrderId, VenueOrderId
@@ -10,6 +10,8 @@ from nautilus_trader.model.objects import Money, Currency, Quantity, Price
 from nautilus_trader.model.orders import LimitOrder
 from nautilus_trader.model.enums import OrderType, OrderSide, TimeInForce, LiquiditySide
 from nautilus_trader.execution.messages import SubmitOrder, CancelOrder
+
+from nautilus_bitbank.execution import BitbankExecutionClient
 
 @pytest.fixture
 def test_instrument():
@@ -638,3 +640,176 @@ def test_parse_order_status_report_zero_average_price_falls_back_to_limit(exec_c
 
     assert report.avg_px is not None
     assert float(report.avg_px) == 220.100
+
+
+# --- #901: Submit retry + rejection / Cancel rejection tests ---
+
+
+@pytest.mark.asyncio
+async def test_submit_order_generates_rejected_on_non_retryable_error(exec_client, test_order, test_instrument):
+    """Test that non-retryable error (30001) results in immediate rejection without retry (#901)."""
+    mock_rust = exec_client._rust_client
+    mock_rust.submit_order.side_effect = Exception("Insufficient balance (30001): not enough JPY")
+
+    exec_client.generate_order_rejected = MagicMock()
+    exec_client.generate_order_accepted = MagicMock()
+
+    command = MagicMock(spec=SubmitOrder)
+    command.order = test_order
+
+    await exec_client._submit_order(command)
+
+    # Should be called exactly once (no retry for 30001)
+    assert mock_rust.submit_order.call_count == 1
+    exec_client.generate_order_accepted.assert_not_called()
+    exec_client.generate_order_rejected.assert_called_once()
+    kwargs = exec_client.generate_order_rejected.call_args[1]
+    assert "30001" in kwargs["reason"]
+
+
+@pytest.mark.asyncio
+async def test_submit_order_retries_on_60011_then_succeeds(exec_client, test_order, test_instrument):
+    """Test that 60011 triggers retry and succeeds on second attempt (#901)."""
+    mock_rust = exec_client._rust_client
+
+    # First call fails with 60011, second succeeds
+    mock_rust.submit_order.side_effect = [
+        Exception("Bitbank Error (60011): Exceed maximum number of orders"),
+        json.dumps({"order_id": 999001}),
+    ]
+
+    exec_client.generate_order_rejected = MagicMock()
+    exec_client.generate_order_accepted = MagicMock()
+
+    # Speed up retry for test
+    exec_client._SUBMIT_RETRY_BASE_DELAY_SEC = 0.01
+
+    command = MagicMock(spec=SubmitOrder)
+    command.order = test_order
+
+    await exec_client._submit_order(command)
+
+    assert mock_rust.submit_order.call_count == 2
+    exec_client.generate_order_accepted.assert_called_once()
+    exec_client.generate_order_rejected.assert_not_called()
+    kwargs = exec_client.generate_order_accepted.call_args[1]
+    assert str(kwargs["venue_order_id"]) == "999001"
+
+
+@pytest.mark.asyncio
+async def test_submit_order_retries_exhausted_on_60011(exec_client, test_order, test_instrument):
+    """Test that 60011 after all 3 retries results in rejection (#901)."""
+    mock_rust = exec_client._rust_client
+    mock_rust.submit_order.side_effect = Exception("Bitbank Error (60011): Exceed maximum number of orders")
+
+    exec_client.generate_order_rejected = MagicMock()
+    exec_client.generate_order_accepted = MagicMock()
+
+    # Speed up retries for test
+    exec_client._SUBMIT_RETRY_BASE_DELAY_SEC = 0.01
+
+    command = MagicMock(spec=SubmitOrder)
+    command.order = test_order
+
+    await exec_client._submit_order(command)
+
+    assert mock_rust.submit_order.call_count == 3  # _SUBMIT_MAX_RETRIES
+    exec_client.generate_order_accepted.assert_not_called()
+    exec_client.generate_order_rejected.assert_called_once()
+    kwargs = exec_client.generate_order_rejected.call_args[1]
+    assert "60011" in kwargs["reason"]
+
+
+@pytest.mark.asyncio
+async def test_submit_order_retries_on_10001_rate_limit(exec_client, test_order, test_instrument):
+    """Test that 10001 (rate limit) triggers retry and succeeds (#901)."""
+    mock_rust = exec_client._rust_client
+
+    # First call fails with 10001 rate limit, second succeeds
+    mock_rust.submit_order.side_effect = [
+        Exception("Bitbank Error (10001): Rate limit exceeded"),
+        json.dumps({"order_id": 999002}),
+    ]
+
+    exec_client.generate_order_rejected = MagicMock()
+    exec_client.generate_order_accepted = MagicMock()
+
+    exec_client._SUBMIT_RETRY_BASE_DELAY_SEC = 0.01
+
+    command = MagicMock(spec=SubmitOrder)
+    command.order = test_order
+
+    await exec_client._submit_order(command)
+
+    assert mock_rust.submit_order.call_count == 2
+    exec_client.generate_order_accepted.assert_called_once()
+    exec_client.generate_order_rejected.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_order_rejects_unsupported_order_type(exec_client, test_instrument):
+    """Test that unsupported order type generates rejection event (#901)."""
+    order = MagicMock()
+    order.client_order_id = ClientOrderId("TEST-OID-UNSUPPORTED")
+    order.instrument_id = test_instrument
+    order.strategy_id = StrategyId("TEST-STRAT")
+    order.side = OrderSide.BUY
+    order.order_type = OrderType.STOP_LIMIT  # Unsupported
+    order.quantity = Quantity.from_str("0.01")
+
+    exec_client.generate_order_rejected = MagicMock()
+
+    command = MagicMock(spec=SubmitOrder)
+    command.order = order
+
+    await exec_client._submit_order(command)
+
+    exec_client.generate_order_rejected.assert_called_once()
+    kwargs = exec_client.generate_order_rejected.call_args[1]
+    assert "Unsupported order type" in kwargs["reason"]
+    # Rust client should not have been called
+    exec_client._rust_client.submit_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_generates_cancel_rejected(exec_client, test_order):
+    """Test that cancel failure generates cancel_rejected event (#901)."""
+    mock_rust = exec_client._rust_client
+    mock_rust.cancel_order.side_effect = Exception("Bitbank Error (30003): Order not found")
+
+    venue_order_id = VenueOrderId("999999")
+    exec_client.generate_order_cancel_rejected = MagicMock()
+    exec_client.generate_order_canceled = MagicMock()
+
+    command = MagicMock(spec=CancelOrder)
+    command.client_order_id = test_order.client_order_id
+    command.venue_order_id = venue_order_id
+    command.instrument_id = test_order.instrument_id
+    command.strategy_id = StrategyId("TEST-STRAT")
+
+    await exec_client._cancel_order(command)
+
+    exec_client.generate_order_canceled.assert_not_called()
+    exec_client.generate_order_cancel_rejected.assert_called_once()
+    kwargs = exec_client.generate_order_cancel_rejected.call_args[1]
+    assert "30003" in kwargs["reason"]
+    assert kwargs["venue_order_id"] == venue_order_id
+
+
+@pytest.mark.parametrize(
+    "exc_str, expected_code",
+    [
+        ("Bitbank Error (60011): Exceed maximum number of orders", 60011),
+        ("Insufficient Funds (60001): not enough balance", 60001),
+        ("Bitbank Error (10001): Rate limit exceeded", 10001),
+        ("Bitbank Error (10007): Timed out", 10007),
+        ("Unknown error without code", None),
+        ("Some error (ABC): not a number", None),
+        ("", None),
+    ],
+)
+def test_extract_error_code(exc_str, expected_code):
+    """Test error code extraction from various Rust error message formats (#901)."""
+    exc = Exception(exc_str)
+    result = BitbankExecutionClient._extract_error_code(exc)
+    assert result == expected_code
