@@ -266,10 +266,10 @@ class BitbankExecutionClient(LiveExecutionClient):
                 self.log.debug(f"Skipping unknown currency: {asset_code}")
                 return
 
-            total_val = int(Decimal(data.get("onhand_amount", "0")))
-            locked_val = int(Decimal(data.get("locked_amount", "0")))
-            free_val = total_val - locked_val 
-            
+            total_val = Decimal(data.get("onhand_amount", "0"))
+            locked_val = Decimal(data.get("locked_amount", "0"))
+            free_val = total_val - locked_val
+
             balance = AccountBalance(
                 Money(total_val, currency),
                 Money(locked_val, currency),
@@ -659,8 +659,8 @@ class BitbankExecutionClient(LiveExecutionClient):
                     if currency is None:
                         continue  # Skip unknown currencies
                     
-                    total = int(Decimal(asset["onhand_amount"]))
-                    locked = int(Decimal(asset["locked_amount"]))
+                    total = Decimal(asset["onhand_amount"])
+                    locked = Decimal(asset["locked_amount"])
                     free = total - locked
                     
                     nautilus_balances.append(
